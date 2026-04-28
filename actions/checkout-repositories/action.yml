@@ -1,0 +1,9 @@
+name: Checkout Labor0 repositories
+description: Checks out every repository described by a graph-agent manifest.
+inputs:
+  manifest_path:
+    description: Path to the graph-agent execution manifest.
+    required: true
+runs:
+  using: node24
+  main: index.js

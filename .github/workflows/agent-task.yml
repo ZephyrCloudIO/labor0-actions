@@ -1,0 +1,63 @@
+name: Labor0 Agent Task
+
+on:
+  workflow_call:
+    inputs:
+      agent_task_session_id:
+        description: Graph-agent task session id.
+        required: true
+        type: string
+      graph_agent_base_url:
+        description: Public graph-agent base URL.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  agent-task:
+    name: Run agent task
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bootstrap graph-agent session
+        id: bootstrap
+        uses: ZephyrCloudIO/labor0-actions/actions/bootstrap@v0
+        with:
+          agent_task_session_id: ${{ inputs.agent_task_session_id }}
+          graph_agent_base_url: ${{ inputs.graph_agent_base_url }}
+
+      - name: Checkout repositories
+        uses: ZephyrCloudIO/labor0-actions/actions/checkout-repositories@v0
+        with:
+          manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
+
+      - name: Run agent
+        id: run-agent
+        uses: ZephyrCloudIO/labor0-actions/actions/run-agent@v0
+        with:
+          manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
+
+      - name: Report result
+        if: always()
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0
+        with:
+          manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
+          event_type: result
+          result_path: ${{ steps.run-agent.outputs.result_path }}
+
+      - name: Report completion
+        if: ${{ success() }}
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0
+        with:
+          manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
+          event_type: completed
+
+      - name: Report failure
+        if: ${{ failure() }}
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0
+        with:
+          manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
+          event_type: failed

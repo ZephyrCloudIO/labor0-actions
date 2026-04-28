@@ -1,0 +1,24 @@
+name: Report Labor0 agent event
+description: Reports a session lifecycle or result event to graph-agent with GitHub Actions OIDC.
+inputs:
+  manifest_path:
+    description: Path to the graph-agent execution manifest.
+    required: true
+  event_type:
+    description: Event type to report.
+    required: true
+  message:
+    description: Optional log or status message.
+    required: false
+  result_path:
+    description: Optional JSON file to include as result_json.
+    required: false
+  dependency_analysis_draft_path:
+    description: Optional dependency analysis draft JSON file.
+    required: false
+  oidc_audience:
+    description: Optional OIDC audience override.
+    required: false
+runs:
+  using: node24
+  main: index.js

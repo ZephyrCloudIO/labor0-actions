@@ -1,0 +1,12 @@
+name: Run Labor0 agent
+description: Runs the requested agent runtime against the bootstrapped manifest prompt.
+inputs:
+  manifest_path:
+    description: Path to the graph-agent execution manifest.
+    required: true
+outputs:
+  result_path:
+    description: Path to the result JSON emitted by the runner.
+runs:
+  using: node24
+  main: index.js

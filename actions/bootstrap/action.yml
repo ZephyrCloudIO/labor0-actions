@@ -1,0 +1,18 @@
+name: Bootstrap Labor0 agent task
+description: Exchanges GitHub Actions OIDC for a graph-agent execution manifest.
+inputs:
+  agent_task_session_id:
+    description: Graph-agent task session id.
+    required: true
+  graph_agent_base_url:
+    description: Public graph-agent base URL.
+    required: true
+  oidc_audience:
+    description: Optional OIDC audience override.
+    required: false
+outputs:
+  manifest_path:
+    description: Path to the downloaded execution manifest.
+runs:
+  using: node24
+  main: index.js
