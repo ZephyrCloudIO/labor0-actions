@@ -1,15 +1,18 @@
 "use strict";
 
+const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
-const { fail, getInput, info, setOutput, writeJSON } = require("../lib/core");
+const { fail, getInput, info, readJSON, setOutput, writeJSON } = require("../lib/core");
 const { readManifest } = require("../lib/manifest");
 const { redact } = require("../lib/redaction");
 
 function main() {
   const manifest = readManifest(getInput("manifest_path", { required: true }));
   const resultPath = path.join(process.env.RUNNER_TEMP || process.cwd(), "labor0-agent-task-result.json");
-  const command = runtimeCommand(manifest);
+  const graphUpdateDraftPath = graphUpdateDraftOutputPath(manifest);
+  const prompt = promptForManifest(manifest, graphUpdateDraftPath);
+  const command = runtimeCommand(manifest, prompt);
   info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
   const startedAt = new Date();
   const result = spawnSync(command[0], command.slice(1), {
@@ -21,7 +24,8 @@ function main() {
       LABOR0_GRAPH_AGENT_TASK_ID: manifest.graph_agent_task_id,
       LABOR0_AGENT_TASK_PURPOSE: manifest.agent_task_purpose || "",
       LABOR0_AGENT_RUNTIME_TYPE: manifest.agent_runtime_type || "",
-      LABOR0_AGENT_PROMPT: manifest.prompt || "",
+      LABOR0_AGENT_PROMPT: prompt,
+      LABOR0_GRAPH_UPDATE_DRAFT_PATH: graphUpdateDraftPath || "",
     },
     encoding: "utf8",
     maxBuffer: 20 * 1024 * 1024,
@@ -45,19 +49,26 @@ function main() {
   if (result.status !== 0) {
     throw new Error(`${command[0]} exited with ${result.status ?? result.signal}`);
   }
+  if (graphUpdateDraftPath) {
+    if (!fs.existsSync(graphUpdateDraftPath)) {
+      throw new Error(`graph_update agent completed without writing ${graphUpdateDraftPath}`);
+    }
+    readJSON(graphUpdateDraftPath);
+    setOutput("graph_update_draft_path", graphUpdateDraftPath);
+  }
 }
 
-function runtimeCommand(manifest) {
+function runtimeCommand(manifest, prompt) {
   if (process.env.LABOR0_AGENT_COMMAND) {
-    return shellCommand(process.env.LABOR0_AGENT_COMMAND, manifest.prompt || "");
+    return shellCommand(process.env.LABOR0_AGENT_COMMAND, prompt);
   }
   switch (manifest.agent_runtime_type) {
     case "codex":
-      return ["codex", "exec", "--ask-for-approval", "never", "--sandbox", "danger-full-access", manifest.prompt || ""];
+      return ["codex", "exec", "--ask-for-approval", "never", "--sandbox", "danger-full-access", prompt];
     case "claude_code":
-      return ["claude", "--print", manifest.prompt || ""];
+      return ["claude", "--print", prompt];
     case "opencode":
-      return ["opencode", "run", manifest.prompt || ""];
+      return ["opencode", "run", prompt];
     default:
       throw new Error(`Unsupported agent_runtime_type: ${manifest.agent_runtime_type || "(empty)"}`);
   }
@@ -66,6 +77,56 @@ function runtimeCommand(manifest) {
 function shellCommand(command, prompt) {
   void prompt;
   return ["bash", "-lc", command];
+}
+
+function graphUpdateDraftOutputPath(manifest) {
+  if (manifest.agent_task_purpose !== "graph_update") {
+    return "";
+  }
+  return path.join(process.env.RUNNER_TEMP || process.cwd(), "labor0-graph-update-draft.json");
+}
+
+function promptForManifest(manifest, graphUpdateDraftPath) {
+  const basePrompt = manifest.prompt || "";
+  if (!graphUpdateDraftPath) {
+    return basePrompt;
+  }
+  return `${basePrompt}
+
+After analyzing the project graph, write the proposed graph update draft as JSON to the file path in LABOR0_GRAPH_UPDATE_DRAFT_PATH. Do not edit the visible graph directly.
+
+The JSON must use this shape:
+{
+  "source_agent_task_session_id": "${manifest.agent_task_session_id}",
+  "summary": "short human-readable summary",
+  "task_drafts": [
+    {
+      "draft_task_key": "stable-key-for-this-draft-task",
+      "task_type": "agent_execution",
+      "title": "visible graph task title",
+      "description": "coding task prompt",
+      "labels": ["optional-label"],
+      "execution_repository_bindings": [
+        {
+          "repository_id": "repository UUID from the manifest",
+          "selected_ref": "branch-or-ref",
+          "access_mode": "read_write",
+          "auto_pull_request_enabled": true
+        }
+      ]
+    }
+  ],
+  "upsert_edges": [
+    {
+      "predecessor": { "draft_task_key": "dependency-key" },
+      "successor": { "draft_task_key": "dependent-key" },
+      "edge_type": "depends_on"
+    }
+  ],
+  "remove_edges": []
+}
+
+Use graph_agent_task_id instead of draft_task_key when an edge references an existing visible graph task. New coding tasks must include at least one read_write execution_repository_bindings entry.`;
 }
 
 function tail(value) {

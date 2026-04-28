@@ -16,6 +16,9 @@ inputs:
   dependency_analysis_draft_path:
     description: Optional dependency analysis draft JSON file.
     required: false
+  graph_update_draft_path:
+    description: Optional graph update draft JSON file.
+    required: false
   oidc_audience:
     description: Optional OIDC audience override.
     required: false

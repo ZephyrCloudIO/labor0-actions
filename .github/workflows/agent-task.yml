@@ -24,40 +24,48 @@ jobs:
     steps:
       - name: Bootstrap graph-agent session
         id: bootstrap
-        uses: ZephyrCloudIO/labor0-actions/actions/bootstrap@v0
+        uses: ZephyrCloudIO/labor0-actions/actions/bootstrap@v1
         with:
           agent_task_session_id: ${{ inputs.agent_task_session_id }}
           graph_agent_base_url: ${{ inputs.graph_agent_base_url }}
 
       - name: Checkout repositories
-        uses: ZephyrCloudIO/labor0-actions/actions/checkout-repositories@v0
+        uses: ZephyrCloudIO/labor0-actions/actions/checkout-repositories@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
 
       - name: Run agent
         id: run-agent
-        uses: ZephyrCloudIO/labor0-actions/actions/run-agent@v0
+        uses: ZephyrCloudIO/labor0-actions/actions/run-agent@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
 
       - name: Report result
         if: always()
-        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
           event_type: result
           result_path: ${{ steps.run-agent.outputs.result_path }}
 
+      - name: Report graph update draft
+        if: ${{ success() && steps.run-agent.outputs.graph_update_draft_path != '' }}
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v1
+        with:
+          manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
+          event_type: graph_update_draft
+          graph_update_draft_path: ${{ steps.run-agent.outputs.graph_update_draft_path }}
+
       - name: Report completion
         if: ${{ success() }}
-        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
           event_type: completed
 
       - name: Report failure
         if: ${{ failure() }}
-        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
           event_type: failed

@@ -10,6 +10,7 @@ async function main() {
   const eventType = getInput("event_type", { required: true });
   const resultPath = getInput("result_path");
   const draftPath = getInput("dependency_analysis_draft_path");
+  const graphUpdateDraftPath = getInput("graph_update_draft_path");
   const baseURL = callbackBaseURL(manifest);
   const audience = getInput("oidc_audience") || baseURL;
   const token = await requestOIDCToken(audience);
@@ -25,6 +26,9 @@ async function main() {
   }
   if (draftPath) {
     payload.dependency_analysis_draft = redact(readJSON(draftPath));
+  }
+  if (graphUpdateDraftPath) {
+    payload.graph_update_draft = redact(readJSON(graphUpdateDraftPath));
   }
 
   const response = await fetch(manifest.callback_url, {

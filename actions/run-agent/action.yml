@@ -7,6 +7,8 @@ inputs:
 outputs:
   result_path:
     description: Path to the result JSON emitted by the runner.
+  graph_update_draft_path:
+    description: Path to the graph update draft JSON emitted by graph-update agents.
 runs:
   using: node24
   main: index.js
