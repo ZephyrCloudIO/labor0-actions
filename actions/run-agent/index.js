@@ -595,7 +595,11 @@ function runtimePrompt(manifest) {
   if (manifest.agent_task_purpose !== "graph_update") {
     return manifest.prompt || "";
   }
+  const graphContext = manifest.graph_update_context
+    ? `\n\nCurrent graph context (JSON; use graph_agent_task_id for existing task refs):\n${JSON.stringify(manifest.graph_update_context, null, 2)}`
+    : "";
   return `${manifest.prompt || ""}
+${graphContext}
 
 Return only one JSON object matching this shape:
 {
@@ -637,6 +641,7 @@ function graphUpdateDraftFromOutput(manifest, stdout) {
   }
   return {
     source_agent_task_session_id: manifest.agent_task_session_id,
+    graph_head_sequence: graphUpdateContextHeadSequence(manifest),
     summary: String(parsed.summary || ""),
     task_drafts: parsed.task_drafts,
     upsert_edges: Array.isArray(parsed.upsert_edges) ? parsed.upsert_edges : [],
@@ -710,6 +715,7 @@ function manifestDebugSummary(manifest) {
     agent_runtime_type: manifest.agent_runtime_type || "",
     agent_model: manifest.agent_model || "",
     prompt_bytes: byteLength(manifest.prompt || ""),
+    graph_update_context: graphUpdateContextDebugSummary(manifest.graph_update_context),
     repository_count: Array.isArray(manifest.repositories) ? manifest.repositories.length : 0,
     repositories: (manifest.repositories || []).map((repository) => ({
       repository_id: repository.repository_id || "",
@@ -760,7 +766,7 @@ function looksLikeGraphUpdateSchema(value) {
 }
 
 function manifestSecretValues(manifest) {
-  const values = [manifest.prompt];
+  const values = [manifest.prompt, runtimePrompt(manifest), ...graphUpdateContextSecretValues(manifest.graph_update_context)];
   for (const value of Object.values(manifest.agent_runtime_environment || {})) {
     values.push(value);
   }
@@ -772,6 +778,43 @@ function manifestSecretValues(manifest) {
   return [...new Set(values.map((value) => String(value || "")).filter((value) => value.length >= 3))].sort(
     (left, right) => right.length - left.length,
   );
+}
+
+function graphUpdateContextHeadSequence(manifest) {
+  const value =
+    manifest &&
+    manifest.graph_update_context &&
+    manifest.graph_update_context.graph_head &&
+    manifest.graph_update_context.graph_head.graph_head_sequence;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function graphUpdateContextDebugSummary(context) {
+  if (!context || typeof context !== "object") {
+    return undefined;
+  }
+  return {
+    graph_head_sequence: graphUpdateContextHeadSequence({ graph_update_context: context }),
+    task_count: Array.isArray(context.tasks) ? context.tasks.length : 0,
+    edge_count: Array.isArray(context.edges) ? context.edges.length : 0,
+    repository_count: Array.isArray(context.repositories) ? context.repositories.length : 0,
+  };
+}
+
+function graphUpdateContextSecretValues(context) {
+  const values = [];
+  if (!context || typeof context !== "object" || !Array.isArray(context.tasks)) {
+    return values;
+  }
+  for (const task of context.tasks) {
+    values.push(task && task.title);
+    values.push(task && task.description);
+    if (Array.isArray(task && task.labels)) {
+      values.push(...task.labels);
+    }
+  }
+  return values;
 }
 
 function sanitizeText(value, secrets) {

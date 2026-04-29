@@ -16,6 +16,13 @@ function readManifest(filePath) {
 
 function maskManifestSecrets(manifest) {
   addMask(manifest.prompt);
+  for (const task of (manifest.graph_update_context && manifest.graph_update_context.tasks) || []) {
+    addMask(task && task.title);
+    addMask(task && task.description);
+    for (const label of (task && task.labels) || []) {
+      addMask(label);
+    }
+  }
   for (const value of Object.values(manifest.agent_runtime_environment || {})) {
     addMask(value);
   }

@@ -26,6 +26,7 @@ test("codex command passes model and graph update schema", () => {
       agent_task_purpose: "graph_update",
       agent_model: "gpt-5.4",
       prompt: "Plan follow-up tasks",
+      graph_update_context: graphUpdateContext(),
     },
     { graphUpdateSchemaPath: "/tmp/graph-update.schema.json" },
   );
@@ -43,6 +44,9 @@ test("codex command passes model and graph update schema", () => {
   assert.equal(command[8], "--model");
   assert.equal(command[9], "gpt-5.4");
   assert.match(command.at(-1), /Return only one JSON object/);
+  assert.match(command.at(-1), /Current graph context/);
+  assert.match(command.at(-1), /Design graph update context/);
+  assert.match(command.at(-1), /"graph_head_sequence": 42/);
 });
 
 test("claude command passes model and structured output schema", () => {
@@ -276,12 +280,16 @@ test("opencode auth preparation preserves explicit config and auth content", () 
 
 test("graph update draft extraction accepts stdout around JSON", () => {
   const draft = graphUpdateDraftFromOutput(
-    { agent_task_session_id: "0199e7be-9000-7000-8000-000000000001" },
+    {
+      agent_task_session_id: "0199e7be-9000-7000-8000-000000000001",
+      graph_update_context: graphUpdateContext(),
+    },
     `planning done
 ${JSON.stringify(graphUpdateDraftJSON())}`,
   );
 
   assert.equal(draft.source_agent_task_session_id, "0199e7be-9000-7000-8000-000000000001");
+  assert.equal(draft.graph_head_sequence, 42);
   assert.equal(draft.task_drafts[0].draft_task_key, "implement-runtime");
   assert.deepEqual(draft.upsert_edges, []);
   assert.deepEqual(draft.remove_edges, []);
@@ -344,6 +352,18 @@ test("debug diagnostics redact prompt, runtime secrets, and repository tokens", 
     agent_runtime_environment: {
       ANTHROPIC_API_KEY: "sk-ant-private",
     },
+    graph_update_context: graphUpdateContext({
+      tasks: [
+        {
+          graph_agent_task_id: "0199e7be-9000-7000-8000-000000000111",
+          task_type: "agent_execution",
+          task_status: "ready",
+          title: "Sensitive existing task",
+          description: "Sensitive existing task description",
+          labels: ["sensitive-label"],
+        },
+      ],
+    }),
     repositories: [
       {
         repository_id: "0199e7be-9000-7000-8000-000000000003",
@@ -359,6 +379,9 @@ test("debug diagnostics redact prompt, runtime secrets, and repository tokens", 
   });
   const stdout = [
     "private planning prompt",
+    "Sensitive existing task",
+    "Sensitive existing task description",
+    "sensitive-label",
     JSON.stringify(graphUpdateDraftJSON()),
     "sk-ant-private",
     "ghs-private-token",
@@ -383,10 +406,24 @@ test("debug diagnostics redact prompt, runtime secrets, and repository tokens", 
 
   const debugArtifact = fs.readFileSync(outputs.debug_artifact_path, "utf8");
   const result = fs.readFileSync(outputs.result_path, "utf8");
-  for (const sensitive of ["private planning prompt", "sk-ant-private", "ghs-private-token"]) {
+  for (const sensitive of [
+    "private planning prompt",
+    "sk-ant-private",
+    "ghs-private-token",
+    "Sensitive existing task",
+    "Sensitive existing task description",
+    "sensitive-label",
+  ]) {
     assert.equal(debugArtifact.includes(sensitive), false);
     assert.equal(result.includes(sensitive), false);
   }
+  const debugJSON = JSON.parse(debugArtifact);
+  assert.deepEqual(debugJSON.manifest.graph_update_context, {
+    graph_head_sequence: 42,
+    task_count: 1,
+    edge_count: 1,
+    repository_count: 1,
+  });
   assert.match(debugArtifact, /\[REDACTED\]/);
   assert.match(debugArtifact, /\[PROMPT_REDACTED\]/);
 });
@@ -432,7 +469,43 @@ function graphUpdateManifest(overrides = {}) {
     agent_runtime_type: "claude_code",
     agent_model: "claude-sonnet-4-6",
     prompt: "Plan follow-up tasks",
+    graph_update_context: graphUpdateContext(),
     repositories: [],
+    ...overrides,
+  };
+}
+
+function graphUpdateContext(overrides = {}) {
+  return {
+    graph_head: {
+      graph_head_sequence: 42,
+    },
+    tasks: [
+      {
+        graph_agent_task_id: "0199e7be-9000-7000-8000-000000000101",
+        task_type: "agent_execution",
+        task_status: "ready",
+        title: "Design graph update context",
+        description: "Make the existing graph visible to the planning task.",
+        labels: ["backend"],
+      },
+    ],
+    edges: [
+      {
+        predecessor_task_id: "0199e7be-9000-7000-8000-000000000101",
+        successor_task_id: "0199e7be-9000-7000-8000-000000000102",
+        edge_type: "depends_on",
+      },
+    ],
+    repositories: [
+      {
+        repository_id: "0199e7be-9000-7000-8000-000000000003",
+        checkout_path: "repositories/0199e7be-9000-7000-8000-000000000003",
+        selected_ref: "refs/heads/main",
+        access_mode: "read_only",
+        auto_pull_request_enabled: null,
+      },
+    ],
     ...overrides,
   };
 }
