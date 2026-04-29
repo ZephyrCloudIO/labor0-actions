@@ -24,25 +24,25 @@ jobs:
     steps:
       - name: Bootstrap graph-agent session
         id: bootstrap
-        uses: ZephyrCloudIO/labor0-actions/actions/bootstrap@v0.1
+        uses: ZephyrCloudIO/labor0-actions/actions/bootstrap@main
         with:
           agent_task_session_id: ${{ inputs.agent_task_session_id }}
           graph_agent_base_url: ${{ inputs.graph_agent_base_url }}
 
       - name: Checkout repositories
-        uses: ZephyrCloudIO/labor0-actions/actions/checkout-repositories@v0.1
+        uses: ZephyrCloudIO/labor0-actions/actions/checkout-repositories@main
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
 
       - name: Run agent
         id: run-agent
-        uses: ZephyrCloudIO/labor0-actions/actions/run-agent@v0.1
+        uses: ZephyrCloudIO/labor0-actions/actions/run-agent@main
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
 
       - name: Report graph update draft
         if: ${{ success() && steps.run-agent.outputs.graph_update_draft_path != '' }}
-        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0.1
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@main
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
           event_type: graph_update_draft
@@ -50,7 +50,7 @@ jobs:
 
       - name: Report pull requests
         if: ${{ success() && steps.run-agent.outputs.pull_requests_path != '' }}
-        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0.1
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@main
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
           event_type: pull_request_linked
@@ -58,7 +58,7 @@ jobs:
 
       - name: Report result
         if: always()
-        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0.1
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@main
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
           event_type: result
@@ -66,14 +66,14 @@ jobs:
 
       - name: Report completion
         if: ${{ success() }}
-        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0.1
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@main
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
           event_type: completed
 
       - name: Report failure
         if: ${{ failure() }}
-        uses: ZephyrCloudIO/labor0-actions/actions/report-event@v0.1
+        uses: ZephyrCloudIO/labor0-actions/actions/report-event@main
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
           event_type: failed
