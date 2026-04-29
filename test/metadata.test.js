@@ -32,5 +32,7 @@ test("reusable workflow only accepts session bootstrap inputs", () => {
   assert.match(workflow, /id-token:\s+write/);
   assert.match(workflow, /graph_update_draft_path:/);
   assert.match(workflow, /pull_requests_path:/);
+  assert.match(workflow, /debug_artifact_path/);
+  assert.match(workflow, /actions\/upload-artifact@v4/);
   assert.match(workflow, /labor0-actions\/actions\/run-agent@main/);
 });

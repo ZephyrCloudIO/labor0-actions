@@ -31,6 +31,27 @@ function info(message) {
   process.stdout.write(`${message}${os.EOL}`);
 }
 
+function isRunnerDebug(env = process.env) {
+  return String(env.RUNNER_DEBUG || "") === "1";
+}
+
+function isAgentDebug(env = process.env) {
+  return /^(1|true|yes|on)$/i.test(String(env.LABOR0_AGENT_DEBUG || "").trim());
+}
+
+function isDebugMode(env = process.env) {
+  return isRunnerDebug(env) || isAgentDebug(env);
+}
+
+function debug(message, env = process.env) {
+  if (isRunnerDebug(env)) {
+    process.stdout.write(`::debug::${escapeCommand(message)}${os.EOL}`);
+  }
+  if (isAgentDebug(env)) {
+    info(`[debug] ${message}`);
+  }
+}
+
 function fail(error) {
   const message = error instanceof Error ? error.message : String(error);
   process.stdout.write(`::error::${escapeCommand(message)}${os.EOL}`);
@@ -55,9 +76,13 @@ function escapeCommand(value) {
 
 module.exports = {
   addMask,
+  debug,
   fail,
   getInput,
   info,
+  isAgentDebug,
+  isDebugMode,
+  isRunnerDebug,
   readJSON,
   setOutput,
   writeJSON,
