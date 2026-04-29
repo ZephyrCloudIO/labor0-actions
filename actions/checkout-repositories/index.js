@@ -34,15 +34,30 @@ function normalizeRef(ref) {
 }
 
 function credentialedGitURL(repository) {
+  const gitURL = repository.git_url;
   const token = repository.token || repository.access_token || (repository.credential && repository.credential.token);
-  if (!token || !/^https:\/\/github\.com\//i.test(repository.git_url || "")) {
-    return repository.git_url;
+  if (!token) {
+    return gitURL;
   }
-  return repository.git_url.replace(/^https:\/\//i, `https://x-access-token:${encodeURIComponent(token)}@`);
+  if (/^https:\/\/github\.com\//i.test(gitURL || "")) {
+    return gitURL.replace(/^https:\/\//i, `https://x-access-token:${encodeURIComponent(token)}@`);
+  }
+  const sshMatch = String(gitURL || "").match(/^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/i);
+  if (!sshMatch) {
+    return gitURL;
+  }
+  return `https://x-access-token:${encodeURIComponent(token)}@github.com/${sshMatch[1]}/${sshMatch[2]}.git`;
 }
 
-try {
-  main();
-} catch (error) {
-  fail(error);
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    fail(error);
+  }
 }
+
+module.exports = {
+  credentialedGitURL,
+  normalizeRef,
+};
