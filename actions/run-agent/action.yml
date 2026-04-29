@@ -15,4 +15,4 @@ outputs:
     description: Path to sanitized debug diagnostics emitted when debug mode is enabled.
 runs:
   using: node24
-  main: index.js
+  main: dist/index.js

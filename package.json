@@ -6,7 +6,14 @@
     "node": "24"
   },
   "scripts": {
+    "build": "ncc build actions/run-agent/index.js --out actions/run-agent/dist --target es2024",
     "test": "node --test",
     "validate:metadata": "node test/metadata.test.js"
+  },
+  "dependencies": {
+    "yaml": "2.8.3"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "0.38.4"
   }
 }
