@@ -8,6 +8,7 @@ const test = require("node:test");
 const { isDebugMode } = require("../actions/lib/core");
 const {
   graphUpdateDraftFromOutput,
+  graphUpdateDraftSchema,
   prepareClaudeCodeAuthentication,
   prepareCodexAuthentication,
   prepareOpenCodeAuthentication,
@@ -47,6 +48,8 @@ test("codex command passes model and graph update schema", () => {
   assert.match(command.at(-1), /Current graph context/);
   assert.match(command.at(-1), /Design graph update context/);
   assert.match(command.at(-1), /"graph_head_sequence": 42/);
+  assert.match(command.at(-1), /"predecessor": \{ "draft_task_key": "stable-kebab-key" \}/);
+  assert.match(command.at(-1), /Do not use predecessor_task_id or successor_task_id/);
 });
 
 test("claude command passes model and structured output schema", () => {
@@ -74,6 +77,11 @@ test("claude command passes model and structured output schema", () => {
   assert.equal(command[8], "--model");
   assert.equal(command[9], "claude-sonnet-4-6");
   assert.match(command.at(-1), /Return only one JSON object/);
+  const schema = JSON.parse(command[7]);
+  assert.deepEqual(schema.properties.upsert_edges.items.required, ["predecessor", "successor"]);
+  assert.equal(schema.properties.upsert_edges.items.properties.predecessor.oneOf.length, 2);
+  assert.deepEqual(schema.properties.remove_edges.items.properties.predecessor.required, ["graph_agent_task_id"]);
+  assert.equal(schema.properties.remove_edges.items.properties.predecessor.properties.draft_task_key, undefined);
 });
 
 test("opencode command passes model and permission bypass", () => {
@@ -295,6 +303,98 @@ ${JSON.stringify(graphUpdateDraftJSON())}`,
   assert.deepEqual(draft.remove_edges, []);
 });
 
+test("graph update draft extraction accepts nested edge refs", () => {
+  const draft = graphUpdateDraftFromOutput(
+    {
+      agent_task_session_id: "0199e7be-9000-7000-8000-000000000003",
+      graph_update_context: graphUpdateContext(),
+    },
+    JSON.stringify(
+      graphUpdateDraftJSON({
+        task_drafts: [
+          {
+            draft_task_key: "implement-runtime",
+            task_type: "agent_execution",
+            title: "Implement runtime",
+            description: "Wire the runtime",
+            execution_repository_bindings: [],
+          },
+          {
+            draft_task_key: "test-runtime",
+            task_type: "agent_execution",
+            title: "Test runtime",
+            description: "Verify the runtime",
+            execution_repository_bindings: [],
+          },
+        ],
+        upsert_edges: [
+          {
+            predecessor: { draft_task_key: "implement-runtime" },
+            successor: { draft_task_key: "test-runtime" },
+            edge_type: "depends_on",
+          },
+        ],
+      }),
+    ),
+  );
+
+  assert.deepEqual(draft.upsert_edges, [
+    {
+      predecessor: { draft_task_key: "implement-runtime" },
+      successor: { draft_task_key: "test-runtime" },
+      edge_type: "depends_on",
+    },
+  ]);
+});
+
+test("graph update draft extraction rejects flat context edge fields", () => {
+  assert.throws(
+    () =>
+      graphUpdateDraftFromOutput(
+        {
+          agent_task_session_id: "0199e7be-9000-7000-8000-000000000004",
+          graph_update_context: graphUpdateContext(),
+        },
+        JSON.stringify(
+          graphUpdateDraftJSON({
+            upsert_edges: [
+              {
+                predecessor_task_id: "0199e7be-9000-7000-8000-000000000101",
+                successor_task_id: "0199e7be-9000-7000-8000-000000000102",
+                edge_type: "depends_on",
+              },
+            ],
+          }),
+        ),
+      ),
+    /graph_update_draft\.upsert_edges\[0\].*predecessor_task_id and successor_task_id are graph context fields only/,
+  );
+});
+
+test("graph update draft extraction rejects draft refs in removed edges", () => {
+  assert.throws(
+    () =>
+      graphUpdateDraftFromOutput(
+        {
+          agent_task_session_id: "0199e7be-9000-7000-8000-000000000005",
+          graph_update_context: graphUpdateContext(),
+        },
+        JSON.stringify(
+          graphUpdateDraftJSON({
+            remove_edges: [
+              {
+                predecessor: { draft_task_key: "implement-runtime" },
+                successor: { graph_agent_task_id: "0199e7be-9000-7000-8000-000000000102" },
+                edge_type: "depends_on",
+              },
+            ],
+          }),
+        ),
+      ),
+    /graph_update_draft\.remove_edges\[0\]\.predecessor must set graph_agent_task_id/,
+  );
+});
+
 test("graph update draft extraction accepts Claude Code structured output envelopes", () => {
   const draft = graphUpdateDraftFromOutput(
     { agent_task_session_id: "0199e7be-9000-7000-8000-000000000002" },
@@ -342,6 +442,61 @@ test("graph update parse failure writes result output before failing", () => {
   assert.equal(result.graph_update_draft_created, false);
   assert.equal(result.draft_parse_error, "graph_update task did not produce a JSON draft");
   assert.match(result.stderr_tail, /no structured output/);
+});
+
+test("graph update validation failure writes result output before failing", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-run-agent-validation-test-"));
+  const outputs = {};
+  const manifest = graphUpdateManifest();
+
+  assert.throws(
+    () =>
+      runAgent(manifest, {
+        tempDir,
+        cwd: tempDir,
+        env: { ANTHROPIC_API_KEY: "sk-ant-test", RUNNER_TEMP: tempDir },
+        installRuntime: () => {},
+        prepareRuntimeAuthentication: () => {},
+        setOutput: (name, value) => {
+          outputs[name] = value;
+        },
+        spawnSync: () => ({
+          status: 0,
+          signal: null,
+          stdout: JSON.stringify(
+            graphUpdateDraftJSON({
+              upsert_edges: [
+                {
+                  predecessor_task_id: "0199e7be-9000-7000-8000-000000000101",
+                  successor_task_id: "0199e7be-9000-7000-8000-000000000102",
+                  edge_type: "depends_on",
+                },
+              ],
+            }),
+          ),
+          stderr: "",
+        }),
+      }),
+    /graph_update_draft\.upsert_edges\[0\]/,
+  );
+
+  assert.equal(outputs.graph_update_draft_path, undefined);
+  assert.equal(outputs.result_path, path.join(tempDir, "labor0-agent-task-result.json"));
+  const result = JSON.parse(fs.readFileSync(outputs.result_path, "utf8"));
+  assert.equal(result.exit_code, 0);
+  assert.equal(result.graph_update_draft_created, false);
+  assert.match(result.draft_parse_error, /graph_update_draft\.upsert_edges\[0\]/);
+});
+
+test("graph update draft schema requires nested edge refs", () => {
+  const schema = graphUpdateDraftSchema();
+
+  assert.deepEqual(schema.properties.upsert_edges.items.required, ["predecessor", "successor"]);
+  assert.deepEqual(schema.properties.remove_edges.items.required, ["predecessor", "successor"]);
+  assert.equal(schema.properties.upsert_edges.items.additionalProperties, false);
+  assert.equal(schema.properties.upsert_edges.items.properties.predecessor.oneOf.length, 2);
+  assert.deepEqual(schema.properties.remove_edges.items.properties.successor.required, ["graph_agent_task_id"]);
+  assert.equal(schema.properties.remove_edges.items.properties.successor.properties.draft_task_key, undefined);
 });
 
 test("debug diagnostics redact prompt, runtime secrets, and repository tokens", () => {
@@ -443,7 +598,7 @@ test("pull request creation defaults on for read-write repositories only", () =>
   assert.equal(shouldCreatePullRequest({ access_mode: "read_only" }), false);
 });
 
-function graphUpdateDraftJSON() {
+function graphUpdateDraftJSON(overrides = {}) {
   return {
     summary: "Create task",
     task_drafts: [
@@ -457,6 +612,7 @@ function graphUpdateDraftJSON() {
     ],
     upsert_edges: [],
     remove_edges: [],
+    ...overrides,
   };
 }
 

@@ -534,6 +534,8 @@ function runtimeLabel(runtimeType) {
 }
 
 function graphUpdateDraftSchema() {
+  const upsertRefSchema = graphUpdateTaskRefSchema(true);
+  const removeRefSchema = graphUpdateTaskRefSchema(false);
   return {
     type: "object",
     additionalProperties: false,
@@ -575,19 +577,59 @@ function graphUpdateDraftSchema() {
       },
       upsert_edges: {
         type: "array",
-        items: {
-          type: "object",
-          additionalProperties: true,
-        },
+        items: graphUpdateEdgeSchema(upsertRefSchema),
       },
       remove_edges: {
         type: "array",
-        items: {
-          type: "object",
-          additionalProperties: true,
-        },
+        items: graphUpdateEdgeSchema(removeRefSchema),
       },
     },
+  };
+}
+
+function graphUpdateEdgeSchema(refSchema) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["predecessor", "successor"],
+    properties: {
+      predecessor: refSchema,
+      successor: refSchema,
+      edge_type: {
+        type: "string",
+        enum: ["depends_on"],
+      },
+    },
+  };
+}
+
+function graphUpdateTaskRefSchema(allowDraftRef) {
+  const graphAgentTaskIDRef = {
+    type: "object",
+    additionalProperties: false,
+    required: ["graph_agent_task_id"],
+    properties: {
+      graph_agent_task_id: { type: "string" },
+    },
+  };
+  if (!allowDraftRef) {
+    return graphAgentTaskIDRef;
+  }
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      graph_agent_task_id: { type: "string" },
+      draft_task_key: { type: "string" },
+    },
+    oneOf: [
+      {
+        required: ["graph_agent_task_id"],
+      },
+      {
+        required: ["draft_task_key"],
+      },
+    ],
   };
 }
 
@@ -621,9 +663,24 @@ Return only one JSON object matching this shape:
       ]
     }
   ],
-  "upsert_edges": [],
-  "remove_edges": []
+  "upsert_edges": [
+    {
+      "predecessor": { "draft_task_key": "stable-kebab-key" },
+      "successor": { "draft_task_key": "another-stable-kebab-key" },
+      "edge_type": "depends_on"
+    }
+  ],
+  "remove_edges": [
+    {
+      "predecessor": { "graph_agent_task_id": "existing predecessor graph_agent_task_id" },
+      "successor": { "graph_agent_task_id": "existing successor graph_agent_task_id" },
+      "edge_type": "depends_on"
+    }
+  ]
 }
+For draft edge refs, use nested predecessor/successor objects only.
+Use graph_agent_task_id for existing tasks from the current graph context and draft_task_key for proposed task_drafts.
+Do not use predecessor_task_id or successor_task_id in draft payloads; those names appear only in the current graph context.
 Do not wrap the JSON in Markdown.`;
 }
 
@@ -639,7 +696,7 @@ function graphUpdateDraftFromOutput(manifest, stdout) {
   if (!Array.isArray(parsed.task_drafts) || parsed.task_drafts.length === 0) {
     throw new Error("graph_update draft must include task_drafts");
   }
-  return {
+  const draft = {
     source_agent_task_session_id: manifest.agent_task_session_id,
     graph_head_sequence: graphUpdateContextHeadSequence(manifest),
     summary: String(parsed.summary || ""),
@@ -647,6 +704,56 @@ function graphUpdateDraftFromOutput(manifest, stdout) {
     upsert_edges: Array.isArray(parsed.upsert_edges) ? parsed.upsert_edges : [],
     remove_edges: Array.isArray(parsed.remove_edges) ? parsed.remove_edges : [],
   };
+  validateGraphUpdateDraftEdgePayloads(draft);
+  return draft;
+}
+
+function validateGraphUpdateDraftEdgePayloads(draft) {
+  validateGraphUpdateDraftEdges("graph_update_draft.upsert_edges", draft.upsert_edges, true);
+  validateGraphUpdateDraftEdges("graph_update_draft.remove_edges", draft.remove_edges, false);
+}
+
+function validateGraphUpdateDraftEdges(field, edges, allowDraftRefs) {
+  if (!Array.isArray(edges)) {
+    throw new Error(`${field} must be an array`);
+  }
+  edges.forEach((edge, index) => {
+    const edgeField = `${field}[${index}]`;
+    if (!edge || typeof edge !== "object" || Array.isArray(edge)) {
+      throw new Error(`${edgeField} must be an object`);
+    }
+    if ("predecessor_task_id" in edge || "successor_task_id" in edge) {
+      throw new Error(
+        `${edgeField} must use predecessor/successor task refs; predecessor_task_id and successor_task_id are graph context fields only`,
+      );
+    }
+    validateGraphUpdateTaskRef(`${edgeField}.predecessor`, edge.predecessor, allowDraftRefs);
+    validateGraphUpdateTaskRef(`${edgeField}.successor`, edge.successor, allowDraftRefs);
+    const edgeType = String(edge.edge_type || "").trim();
+    if (edgeType && edgeType !== "depends_on") {
+      throw new Error(`${edgeField}.edge_type must be depends_on`);
+    }
+  });
+}
+
+function validateGraphUpdateTaskRef(field, ref, allowDraftRef) {
+  if (!ref || typeof ref !== "object" || Array.isArray(ref)) {
+    throw new Error(`${field} must be an object`);
+  }
+  const graphAgentTaskID = String(ref.graph_agent_task_id || "").trim();
+  const draftTaskKey = String(ref.draft_task_key || "").trim();
+  if (allowDraftRef) {
+    if ((graphAgentTaskID === "") === (draftTaskKey === "")) {
+      throw new Error(`${field} must set exactly one of graph_agent_task_id or draft_task_key`);
+    }
+    return;
+  }
+  if (draftTaskKey) {
+    throw new Error(`${field} must set graph_agent_task_id; draft_task_key is only allowed in upsert_edges`);
+  }
+  if (!graphAgentTaskID) {
+    throw new Error(`${field} must set graph_agent_task_id`);
+  }
 }
 
 function extractJSONObject(value) {
