@@ -15,13 +15,15 @@ function main() {
   const graphUpdateSchemaPath = path.join(tempDir, "labor0-graph-update-draft.schema.json");
   const pullRequestsPath = path.join(tempDir, "labor0-agent-task-pull-requests.json");
 
+  const env = agentEnvironment(manifest);
+  validateRuntimeAuth(manifest, env);
   installRuntime(manifest.agent_runtime_type);
+  prepareRuntimeAuthentication(manifest, env, { tempDir });
   if (manifest.agent_task_purpose === "graph_update") {
     writeJSON(graphUpdateSchemaPath, graphUpdateDraftSchema());
   }
   const command = runtimeCommand(manifest, { graphUpdateSchemaPath });
   const cwd = process.env.GITHUB_WORKSPACE || process.cwd();
-  const env = agentEnvironment(manifest);
   info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
   const startedAt = new Date();
   const result = spawnSync(command[0], command.slice(1), {
@@ -94,6 +96,7 @@ function installRuntime(runtimeType) {
       installNpmPackageIfMissing("claude", "@anthropic-ai/claude-code");
       break;
     case "opencode":
+      installNpmPackageIfMissing("opencode", "opencode-ai");
       break;
     default:
       throw new Error(`Unsupported agent_runtime_type: ${runtimeType || "(empty)"}`);
@@ -147,9 +150,121 @@ function runtimeCommand(manifest, options = {}) {
         prompt,
       ]);
     case "opencode":
-      return compact(["opencode", "run", prompt]);
+      return compact([
+        "opencode",
+        "run",
+        "--dangerously-skip-permissions",
+        manifest.agent_model ? "--model" : "",
+        manifest.agent_model || "",
+        prompt,
+      ]);
     default:
       throw new Error(`Unsupported agent_runtime_type: ${manifest.agent_runtime_type || "(empty)"}`);
+  }
+}
+
+function validateRuntimeAuth(manifest, env) {
+  const status = runtimeAuthStatus(manifest.agent_runtime_type, env);
+  if (!status.ok) {
+    throw new Error(
+      `${runtimeLabel(manifest.agent_runtime_type)} is missing runtime auth. Configure ${status.missing.join(" or ")} in the workspace Agent credentials settings.`,
+    );
+  }
+  return status;
+}
+
+function runtimeAuthStatus(runtimeType, env) {
+  const has = (key) => String(env[key] || "").trim().length > 0;
+  switch (runtimeType) {
+    case "codex":
+      return has("OPENAI_API_KEY")
+        ? { ok: true, missing: [] }
+        : { ok: false, missing: ["OPENAI_API_KEY"] };
+    case "claude_code":
+      return has("ANTHROPIC_API_KEY") || has("ANTHROPIC_AUTH_TOKEN")
+        ? { ok: true, missing: [] }
+        : { ok: false, missing: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] };
+    case "opencode":
+      return has("OPENAI_API_KEY") || has("ANTHROPIC_API_KEY") || has("OPENCODE_CONFIG_CONTENT")
+        ? { ok: true, missing: [] }
+        : { ok: false, missing: ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENCODE_CONFIG_CONTENT"] };
+    default:
+      throw new Error(`Unsupported agent_runtime_type: ${runtimeType || "(empty)"}`);
+  }
+}
+
+function prepareRuntimeAuthentication(manifest, env, options = {}) {
+  switch (manifest.agent_runtime_type) {
+    case "codex":
+      return prepareCodexAuthentication(env, options);
+    case "opencode":
+      return prepareOpenCodeAuthentication(env);
+    case "claude_code":
+      return null;
+    default:
+      throw new Error(`Unsupported agent_runtime_type: ${manifest.agent_runtime_type || "(empty)"}`);
+  }
+}
+
+function prepareCodexAuthentication(env, options = {}) {
+  const tempDir = options.tempDir || process.env.RUNNER_TEMP || process.cwd();
+  const runner = options.runner || run;
+  const codexHome = fs.mkdtempSync(path.join(tempDir, "labor0-codex-home-"));
+  fs.writeFileSync(path.join(codexHome, "config.toml"), 'forced_login_method = "api"\n', {
+    mode: 0o600,
+  });
+  env.CODEX_HOME = codexHome;
+  runner("codex", ["login", "--with-api-key"], {
+    capture: true,
+    env,
+    input: `${env.OPENAI_API_KEY}\n`,
+  });
+  return codexHome;
+}
+
+function prepareOpenCodeAuthentication(env) {
+  if (String(env.OPENCODE_CONFIG_CONTENT || "").trim()) {
+    return env.OPENCODE_CONFIG_CONTENT;
+  }
+  env.OPENCODE_CONFIG_CONTENT = JSON.stringify(synthesizeOpenCodeConfig(env));
+  return env.OPENCODE_CONFIG_CONTENT;
+}
+
+function synthesizeOpenCodeConfig(env) {
+  const provider = {};
+  if (String(env.OPENAI_API_KEY || "").trim()) {
+    provider.openai = {
+      options: {
+        apiKey: "{env:OPENAI_API_KEY}",
+      },
+    };
+  }
+  if (String(env.ANTHROPIC_API_KEY || "").trim()) {
+    provider.anthropic = {
+      options: {
+        apiKey: "{env:ANTHROPIC_API_KEY}",
+        ...(String(env.ANTHROPIC_BASE_URL || "").trim()
+          ? { baseURL: "{env:ANTHROPIC_BASE_URL}" }
+          : {}),
+      },
+    };
+  }
+  return {
+    $schema: "https://opencode.ai/config.json",
+    provider,
+  };
+}
+
+function runtimeLabel(runtimeType) {
+  switch (runtimeType) {
+    case "codex":
+      return "Codex";
+    case "claude_code":
+      return "Claude Code";
+    case "opencode":
+      return "OpenCode";
+    default:
+      return runtimeType || "Agent runtime";
   }
 }
 
@@ -389,7 +504,8 @@ function run(command, args, options = {}) {
     cwd: options.cwd || process.cwd(),
     env: options.env || process.env,
     encoding: "utf8",
-    stdio: options.capture ? "pipe" : "inherit",
+    input: options.input,
+    stdio: options.capture || options.input !== undefined ? "pipe" : "inherit",
   });
   if (result.status !== 0) {
     const stderr = result.stderr || "";
@@ -416,9 +532,16 @@ if (require.main === module) {
 }
 
 module.exports = {
+  agentEnvironment,
   extractJSONObject,
   graphUpdateDraftSchema,
   graphUpdateDraftFromOutput,
+  prepareCodexAuthentication,
+  prepareOpenCodeAuthentication,
+  prepareRuntimeAuthentication,
+  runtimeAuthStatus,
   runtimeCommand,
   shouldCreatePullRequest,
+  synthesizeOpenCodeConfig,
+  validateRuntimeAuth,
 };

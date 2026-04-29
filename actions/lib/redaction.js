@@ -9,6 +9,8 @@ const SECRET_KEYS = new Set([
   "password",
   "private_key",
   "prompt",
+  "api_key",
+  "auth_token",
   "secret",
   "token",
 ]);
@@ -28,8 +30,22 @@ function redact(value) {
 }
 
 function shouldRedactKey(key) {
-  const normalized = key.replace(/[A-Z]/g, (match) => `_${match.toLowerCase()}`).toLowerCase();
-  return SECRET_KEYS.has(normalized) || normalized.endsWith("_token") || normalized.endsWith("_secret");
+  const normalized = normalizeKey(key);
+  return (
+    SECRET_KEYS.has(normalized) ||
+    normalized.endsWith("_api_key") ||
+    normalized.endsWith("_auth_token") ||
+    normalized.endsWith("_token") ||
+    normalized.endsWith("_secret")
+  );
 }
 
-module.exports = { redact, shouldRedactKey };
+function normalizeKey(key) {
+  return String(key || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toLowerCase();
+}
+
+module.exports = { normalizeKey, redact, shouldRedactKey };
