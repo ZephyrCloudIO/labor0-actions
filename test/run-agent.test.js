@@ -20,7 +20,7 @@ const {
   validateRuntimeAuth,
 } = require("../actions/run-agent/index");
 
-test("codex command passes model and graph update schema", () => {
+test("codex command passes model and YAML graph update prompt", () => {
   const command = runtimeCommand(
     {
       agent_runtime_type: "codex",
@@ -32,27 +32,27 @@ test("codex command passes model and graph update schema", () => {
     { graphUpdateSchemaPath: "/tmp/graph-update.schema.json" },
   );
 
-  assert.deepEqual(command.slice(0, 7), [
+  assert.deepEqual(command.slice(0, 6), [
     "codex",
     "exec",
     "--full-auto",
     "--sandbox",
     "danger-full-access",
     "--skip-git-repo-check",
-    "--output-schema",
   ]);
-  assert.equal(command[7], "/tmp/graph-update.schema.json");
-  assert.equal(command[8], "--model");
-  assert.equal(command[9], "gpt-5.4");
-  assert.match(command.at(-1), /Return only one JSON object/);
+  assert.equal(command.includes("--output-schema"), false);
+  assert.equal(command.includes("/tmp/graph-update.schema.json"), false);
+  assert.equal(command[6], "--model");
+  assert.equal(command[7], "gpt-5.4");
+  assert.match(command.at(-1), /Return only one YAML document/);
   assert.match(command.at(-1), /Current graph context/);
   assert.match(command.at(-1), /Design graph update context/);
   assert.match(command.at(-1), /"graph_head_sequence": 42/);
-  assert.match(command.at(-1), /"predecessor": \{ "draft_task_key": "stable-kebab-key" \}/);
+  assert.match(command.at(-1), /predecessor:\n\s+draft_task_key: stable-kebab-key/);
   assert.match(command.at(-1), /Do not use predecessor_task_id or successor_task_id/);
 });
 
-test("claude command passes model and structured output schema", () => {
+test("claude command passes model without structured output schema", () => {
   const command = runtimeCommand(
     {
       agent_runtime_type: "claude_code",
@@ -65,23 +65,13 @@ test("claude command passes model and structured output schema", () => {
 
   assert.equal(command[0], "claude");
   assert.equal(command[1], "-p");
-  assert.deepEqual(command.slice(2, 8), [
-    "--permission-mode",
-    "bypassPermissions",
-    "--output-format",
-    "json",
-    "--json-schema",
-    command[7],
-  ]);
-  assert.doesNotThrow(() => JSON.parse(command[7]));
-  assert.equal(command[8], "--model");
-  assert.equal(command[9], "claude-sonnet-4-6");
-  assert.match(command.at(-1), /Return only one JSON object/);
-  const schema = JSON.parse(command[7]);
-  assert.deepEqual(schema.properties.upsert_edges.items.required, ["predecessor", "successor"]);
-  assert.equal(schema.properties.upsert_edges.items.properties.predecessor.oneOf.length, 2);
-  assert.deepEqual(schema.properties.remove_edges.items.properties.predecessor.required, ["graph_agent_task_id"]);
-  assert.equal(schema.properties.remove_edges.items.properties.predecessor.properties.draft_task_key, undefined);
+  assert.deepEqual(command.slice(2, 4), ["--permission-mode", "bypassPermissions"]);
+  assert.equal(command.includes("--output-format"), false);
+  assert.equal(command.includes("--json-schema"), false);
+  assert.equal(command.includes("json"), false);
+  assert.equal(command[4], "--model");
+  assert.equal(command[5], "claude-sonnet-4-6");
+  assert.match(command.at(-1), /Return only one YAML document/);
 });
 
 test("opencode command passes model and permission bypass", () => {
@@ -303,6 +293,116 @@ ${JSON.stringify(graphUpdateDraftJSON())}`,
   assert.deepEqual(draft.remove_edges, []);
 });
 
+test("graph update draft extraction accepts plain YAML", () => {
+  const draft = graphUpdateDraftFromOutput(
+    {
+      agent_task_session_id: "0199e7be-9000-7000-8000-000000000006",
+      graph_update_context: graphUpdateContext(),
+    },
+    `summary: Create YAML task graph
+task_drafts:
+  - draft_task_key: implement-runtime
+    task_type: agent_execution
+    title: Implement runtime
+    description: Wire the runtime
+    labels:
+      - backend
+      - runtime
+    execution_repository_bindings:
+      - repository_id: 0199e7be-9000-7000-8000-000000000003
+        selected_ref: refs/heads/main
+        access_mode: read_write
+        auto_pull_request_enabled: true
+  - draft_task_key: test-runtime
+    task_type: agent_execution
+    title: Test runtime
+    description: Verify the runtime
+    execution_repository_bindings: []
+upsert_edges:
+  - predecessor:
+      draft_task_key: implement-runtime
+    successor:
+      draft_task_key: test-runtime
+    edge_type: depends_on
+remove_edges: []`,
+  );
+
+  assert.equal(draft.source_agent_task_session_id, "0199e7be-9000-7000-8000-000000000006");
+  assert.equal(draft.graph_head_sequence, 42);
+  assert.equal(draft.summary, "Create YAML task graph");
+  assert.deepEqual(draft.task_drafts[0].labels, ["backend", "runtime"]);
+  assert.equal(draft.task_drafts[0].execution_repository_bindings[0].auto_pull_request_enabled, true);
+  assert.deepEqual(draft.upsert_edges, [
+    {
+      predecessor: { draft_task_key: "implement-runtime" },
+      successor: { draft_task_key: "test-runtime" },
+      edge_type: "depends_on",
+    },
+  ]);
+});
+
+test("graph update draft extraction accepts fenced YAML with flow refs", () => {
+  const draft = graphUpdateDraftFromOutput(
+    {
+      agent_task_session_id: "0199e7be-9000-7000-8000-000000000007",
+      graph_update_context: graphUpdateContext(),
+    },
+    `Created the graph update draft.
+
+\`\`\`yaml
+summary: Create fenced YAML task
+task_drafts:
+  - draft_task_key: implement-runtime
+    task_type: agent_execution
+    title: Implement runtime
+    description: Wire the runtime
+    labels: [backend]
+    execution_repository_bindings: []
+upsert_edges:
+  - predecessor: { draft_task_key: implement-runtime }
+    successor: { graph_agent_task_id: 0199e7be-9000-7000-8000-000000000101 }
+    edge_type: depends_on
+remove_edges: []
+\`\`\``,
+  );
+
+  assert.equal(draft.source_agent_task_session_id, "0199e7be-9000-7000-8000-000000000007");
+  assert.equal(draft.summary, "Create fenced YAML task");
+  assert.deepEqual(draft.task_drafts[0].labels, ["backend"]);
+  assert.deepEqual(draft.upsert_edges[0], {
+    predecessor: { draft_task_key: "implement-runtime" },
+    successor: { graph_agent_task_id: "0199e7be-9000-7000-8000-000000000101" },
+    edge_type: "depends_on",
+  });
+});
+
+test("graph update draft extraction accepts YAML inside Claude result strings", () => {
+  const draft = graphUpdateDraftFromOutput(
+    {
+      agent_task_session_id: "0199e7be-9000-7000-8000-000000000008",
+      graph_update_context: graphUpdateContext(),
+    },
+    JSON.stringify({
+      type: "result",
+      result: `summary: Create YAML result task
+task_drafts:
+  - draft_task_key: implement-runtime
+    task_type: agent_execution
+    title: Implement runtime
+    description: Wire the runtime
+    execution_repository_bindings: []
+upsert_edges: []
+remove_edges: []
+
+Done.`,
+    }),
+  );
+
+  assert.equal(draft.source_agent_task_session_id, "0199e7be-9000-7000-8000-000000000008");
+  assert.equal(draft.summary, "Create YAML result task");
+  assert.equal(draft.task_drafts[0].draft_task_key, "implement-runtime");
+});
+
 test("graph update draft extraction accepts nested edge refs", () => {
   const draft = graphUpdateDraftFromOutput(
     {
@@ -429,18 +529,18 @@ test("graph update parse failure writes result output before failing", () => {
         spawnSync: () => ({
           status: 0,
           signal: null,
-          stdout: "planning completed without a JSON object",
+          stdout: "planning completed without a YAML document",
           stderr: "warning: no structured output",
         }),
       }),
-    /graph_update task did not produce a JSON draft/,
+    /graph_update task did not produce a YAML draft/,
   );
 
   assert.equal(outputs.result_path, path.join(tempDir, "labor0-agent-task-result.json"));
   const result = JSON.parse(fs.readFileSync(outputs.result_path, "utf8"));
   assert.equal(result.exit_code, 0);
   assert.equal(result.graph_update_draft_created, false);
-  assert.equal(result.draft_parse_error, "graph_update task did not produce a JSON draft");
+  assert.equal(result.draft_parse_error, "graph_update task did not produce a YAML draft");
   assert.match(result.stderr_tail, /no structured output/);
 });
 

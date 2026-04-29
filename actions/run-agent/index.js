@@ -18,7 +18,6 @@ function runAgent(manifest, options = {}) {
   const resultPath = path.join(tempDir, "labor0-agent-task-result.json");
   const debugArtifactPath = path.join(tempDir, "labor0-agent-debug-diagnostics.json");
   const graphUpdateDraftPath = path.join(tempDir, "labor0-graph-update-draft.json");
-  const graphUpdateSchemaPath = path.join(tempDir, "labor0-graph-update-draft.schema.json");
   const pullRequestsPath = path.join(tempDir, "labor0-agent-task-pull-requests.json");
   const emitOutput = options.setOutput || setOutput;
   const debugEnabled = isDebugMode(baseEnv);
@@ -41,10 +40,7 @@ function runAgent(manifest, options = {}) {
     runtimeValidator(manifest, env);
     runtimeInstaller(manifest.agent_runtime_type);
     runtimeAuthPreparer(manifest, env, { tempDir });
-    if (manifest.agent_task_purpose === "graph_update") {
-      writeJSON(graphUpdateSchemaPath, graphUpdateDraftSchema());
-    }
-    command = runtimeCommand(manifest, { graphUpdateSchemaPath, env: baseEnv });
+    command = runtimeCommand(manifest, { env: baseEnv });
     const cwd = options.cwd || baseEnv.GITHUB_WORKSPACE || process.cwd();
     recordDebug(debugLines, baseEnv, secrets, "manifest", manifestDebugSummary(manifest));
     recordDebug(debugLines, baseEnv, secrets, "runtime command", commandForDebug(command, manifest, secrets));
@@ -194,8 +190,6 @@ function runtimeCommand(manifest, options = {}) {
   if (env.LABOR0_AGENT_COMMAND) {
     return shellCommand(env.LABOR0_AGENT_COMMAND);
   }
-  const graphUpdateSchemaPath =
-    manifest.agent_task_purpose === "graph_update" ? options.graphUpdateSchemaPath : "";
   switch (manifest.agent_runtime_type) {
     case "codex":
       return compact([
@@ -205,8 +199,6 @@ function runtimeCommand(manifest, options = {}) {
         "--sandbox",
         "danger-full-access",
         "--skip-git-repo-check",
-        graphUpdateSchemaPath ? "--output-schema" : "",
-        graphUpdateSchemaPath,
         manifest.agent_model ? "--model" : "",
         manifest.agent_model || "",
         prompt,
@@ -217,10 +209,6 @@ function runtimeCommand(manifest, options = {}) {
         "-p",
         "--permission-mode",
         "bypassPermissions",
-        graphUpdateSchemaPath ? "--output-format" : "",
-        graphUpdateSchemaPath ? "json" : "",
-        graphUpdateSchemaPath ? "--json-schema" : "",
-        graphUpdateSchemaPath ? JSON.stringify(graphUpdateDraftSchema()) : "",
         manifest.agent_model ? "--model" : "",
         manifest.agent_model || "",
         prompt,
@@ -643,45 +631,37 @@ function runtimePrompt(manifest) {
   return `${manifest.prompt || ""}
 ${graphContext}
 
-Return only one JSON object matching this shape:
-{
-  "summary": "short summary",
-  "task_drafts": [
-    {
-      "draft_task_key": "stable-kebab-key",
-      "task_type": "agent_execution",
-      "title": "task title",
-      "description": "task details",
-      "labels": ["label"],
-      "execution_repository_bindings": [
-        {
-          "repository_id": "uuid from the manifest repositories list",
-          "selected_ref": "refs/heads/main",
-          "access_mode": "read_write",
-          "auto_pull_request_enabled": true
-        }
-      ]
-    }
-  ],
-  "upsert_edges": [
-    {
-      "predecessor": { "draft_task_key": "stable-kebab-key" },
-      "successor": { "draft_task_key": "another-stable-kebab-key" },
-      "edge_type": "depends_on"
-    }
-  ],
-  "remove_edges": [
-    {
-      "predecessor": { "graph_agent_task_id": "existing predecessor graph_agent_task_id" },
-      "successor": { "graph_agent_task_id": "existing successor graph_agent_task_id" },
-      "edge_type": "depends_on"
-    }
-  ]
-}
+Return only one YAML document matching this shape:
+summary: short summary
+task_drafts:
+  - draft_task_key: stable-kebab-key
+    task_type: agent_execution
+    title: task title
+    description: task details
+    labels:
+      - label
+    execution_repository_bindings:
+      - repository_id: uuid from the manifest repositories list
+        selected_ref: refs/heads/main
+        access_mode: read_write
+        auto_pull_request_enabled: true
+upsert_edges:
+  - predecessor:
+      draft_task_key: stable-kebab-key
+    successor:
+      draft_task_key: another-stable-kebab-key
+    edge_type: depends_on
+remove_edges:
+  - predecessor:
+      graph_agent_task_id: existing predecessor graph_agent_task_id
+    successor:
+      graph_agent_task_id: existing successor graph_agent_task_id
+    edge_type: depends_on
+
 For draft edge refs, use nested predecessor/successor objects only.
 Use graph_agent_task_id for existing tasks from the current graph context and draft_task_key for proposed task_drafts.
 Do not use predecessor_task_id or successor_task_id in draft payloads; those names appear only in the current graph context.
-Do not wrap the JSON in Markdown.`;
+Do not wrap the YAML in Markdown.`;
 }
 
 function shellCommand(command) {
@@ -689,9 +669,9 @@ function shellCommand(command) {
 }
 
 function graphUpdateDraftFromOutput(manifest, stdout) {
-  const parsed = graphUpdateDraftCandidate(extractJSONObject(stdout));
+  const parsed = graphUpdateDraftDocumentCandidate(stdout);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("graph_update task did not produce a JSON draft");
+    throw new Error("graph_update task did not produce a YAML draft");
   }
   if (!Array.isArray(parsed.task_drafts) || parsed.task_drafts.length === 0) {
     throw new Error("graph_update draft must include task_drafts");
@@ -706,6 +686,23 @@ function graphUpdateDraftFromOutput(manifest, stdout) {
   };
   validateGraphUpdateDraftEdgePayloads(draft);
   return draft;
+}
+
+function graphUpdateDraftDocumentCandidate(value) {
+  const jsonCandidate = graphUpdateDraftCandidate(extractJSONObject(value));
+  if (jsonCandidate) {
+    return jsonCandidate;
+  }
+  const yamlDocument = extractYAMLDocument(value);
+  if (!yamlDocument) {
+    return null;
+  }
+  try {
+    return graphUpdateDraftCandidate(parseYAMLSubset(yamlDocument));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`failed to parse graph_update YAML draft: ${message}`);
+  }
 }
 
 function validateGraphUpdateDraftEdgePayloads(draft) {
@@ -785,7 +782,7 @@ function graphUpdateDraftCandidate(parsed) {
     return parsed.structured_output;
   }
   if (typeof parsed.structured_output === "string") {
-    return graphUpdateDraftCandidate(extractJSONObject(parsed.structured_output));
+    return graphUpdateDraftDocumentCandidate(parsed.structured_output);
   }
   if (Array.isArray(parsed.task_drafts) || typeof parsed.summary === "string") {
     return parsed;
@@ -794,9 +791,296 @@ function graphUpdateDraftCandidate(parsed) {
     return graphUpdateDraftCandidate(parsed.result);
   }
   if (typeof parsed.result === "string") {
-    return graphUpdateDraftCandidate(extractJSONObject(parsed.result));
+    return graphUpdateDraftDocumentCandidate(parsed.result);
   }
   return null;
+}
+
+function extractYAMLDocument(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  const fencePattern = /```[ \t]*([a-zA-Z0-9_-]*)?[ \t]*\n([\s\S]*?)```/g;
+  for (let match = fencePattern.exec(trimmed); match; match = fencePattern.exec(trimmed)) {
+    const language = String(match[1] || "").toLowerCase();
+    const body = match[2].trim();
+    if ((language === "" || language === "yaml" || language === "yml") && looksLikeGraphUpdateYAML(body)) {
+      return body;
+    }
+  }
+
+  const lines = trimmed.split(/\r?\n/);
+  const start = lines.findIndex((line) => /^\s*(summary|task_drafts|upsert_edges|remove_edges)\s*:/.test(line));
+  if (start === -1) {
+    return "";
+  }
+  const documentLines = [];
+  for (const line of lines.slice(start)) {
+    if (/^\s*```\s*$/.test(line)) {
+      continue;
+    }
+    if (
+      documentLines.length > 0 &&
+      /^\S/.test(line) &&
+      !/^(summary|task_drafts|upsert_edges|remove_edges)\s*:/.test(line) &&
+      !/^(---|\.\.\.)\s*$/.test(line)
+    ) {
+      break;
+    }
+    documentLines.push(line);
+  }
+  return documentLines.join("\n").trim();
+}
+
+function looksLikeGraphUpdateYAML(value) {
+  return /^\s*(summary|task_drafts|upsert_edges|remove_edges)\s*:/m.test(String(value || ""));
+}
+
+function parseYAMLSubset(value) {
+  const lines = yamlLogicalLines(value);
+  if (lines.length === 0) {
+    return null;
+  }
+  const [parsed, index] = parseYAMLBlock(lines, 0, lines[0].indent);
+  if (index !== lines.length) {
+    throw new Error(`unexpected YAML content on line ${lines[index].lineNumber}`);
+  }
+  return parsed;
+}
+
+function yamlLogicalLines(value) {
+  return String(value || "")
+    .replace(/\t/g, "  ")
+    .split(/\r?\n/)
+    .map((raw, index) => ({
+      raw,
+      lineNumber: index + 1,
+      indent: raw.match(/^ */)[0].length,
+      text: stripYAMLComment(raw.trim()),
+    }))
+    .filter((line) => line.text && line.text !== "---" && line.text !== "...");
+}
+
+function stripYAMLComment(value) {
+  let quote = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quote) {
+      if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "#" && (index === 0 || /\s/.test(value[index - 1]))) {
+      return value.slice(0, index).trimEnd();
+    }
+  }
+  return value;
+}
+
+function parseYAMLBlock(lines, index, indent) {
+  const line = lines[index];
+  if (!line || line.indent < indent) {
+    return [null, index];
+  }
+  if (line.indent === indent && line.text.startsWith("-")) {
+    return parseYAMLSequence(lines, index, indent);
+  }
+  return parseYAMLMapping(lines, index, indent);
+}
+
+function parseYAMLMapping(lines, index, indent, target = {}) {
+  let cursor = index;
+  while (cursor < lines.length) {
+    const line = lines[cursor];
+    if (line.indent < indent) {
+      break;
+    }
+    if (line.indent > indent) {
+      throw new Error(`unexpected indentation on line ${line.lineNumber}`);
+    }
+    if (line.text.startsWith("-")) {
+      throw new Error(`expected YAML mapping on line ${line.lineNumber}`);
+    }
+    cursor = parseYAMLPairInto(target, line.text, lines, cursor + 1, indent, line.lineNumber);
+  }
+  return [target, cursor];
+}
+
+function parseYAMLSequence(lines, index, indent) {
+  const items = [];
+  let cursor = index;
+  while (cursor < lines.length) {
+    const line = lines[cursor];
+    if (line.indent < indent) {
+      break;
+    }
+    if (line.indent !== indent || !line.text.startsWith("-")) {
+      break;
+    }
+    const itemText = line.text.slice(1).trimStart();
+    cursor += 1;
+    if (!itemText) {
+      if (cursor < lines.length && lines[cursor].indent > indent) {
+        const [child, next] = parseYAMLBlock(lines, cursor, lines[cursor].indent);
+        items.push(child);
+        cursor = next;
+      } else {
+        items.push(null);
+      }
+      continue;
+    }
+    if (isYAMLKeyValue(itemText)) {
+      const item = {};
+      const pairIndent = indent + 2;
+      cursor = parseYAMLPairInto(item, itemText, lines, cursor, pairIndent, line.lineNumber);
+      if (cursor < lines.length && lines[cursor].indent > indent) {
+        const [merged, next] = parseYAMLMapping(lines, cursor, pairIndent, item);
+        items.push(merged);
+        cursor = next;
+      } else {
+        items.push(item);
+      }
+      continue;
+    }
+    items.push(parseYAMLScalar(itemText));
+  }
+  return [items, cursor];
+}
+
+function parseYAMLPairInto(target, text, lines, index, indent, lineNumber) {
+  const [key, valueText] = parseYAMLKeyValue(text, lineNumber);
+  if (!valueText) {
+    if (index < lines.length && lines[index].indent > indent) {
+      const [child, next] = parseYAMLBlock(lines, index, lines[index].indent);
+      target[key] = child;
+      return next;
+    }
+    target[key] = null;
+    return index;
+  }
+  target[key] = parseYAMLScalar(valueText);
+  return index;
+}
+
+function parseYAMLKeyValue(text, lineNumber) {
+  const colon = text.indexOf(":");
+  if (colon <= 0) {
+    throw new Error(`expected key/value pair on line ${lineNumber}`);
+  }
+  const key = text.slice(0, colon).trim();
+  if (!key) {
+    throw new Error(`expected YAML key on line ${lineNumber}`);
+  }
+  return [unquoteYAMLString(key), text.slice(colon + 1).trim()];
+}
+
+function isYAMLKeyValue(text) {
+  const colon = text.indexOf(":");
+  return colon > 0 && !/^[{\[]/.test(text.trimStart());
+}
+
+function parseYAMLScalar(value) {
+  const trimmed = stripYAMLComment(String(value || "").trim());
+  if (trimmed === "") {
+    return "";
+  }
+  if (trimmed === "[]") {
+    return [];
+  }
+  if (trimmed === "{}") {
+    return {};
+  }
+  if (trimmed === "null" || trimmed === "~") {
+    return null;
+  }
+  if (trimmed === "true") {
+    return true;
+  }
+  if (trimmed === "false") {
+    return false;
+  }
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+    return Number(trimmed);
+  }
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    return parseYAMLFlowSequence(trimmed);
+  }
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return parseYAMLFlowMapping(trimmed);
+  }
+  return unquoteYAMLString(trimmed);
+}
+
+function parseYAMLFlowSequence(value) {
+  const body = value.slice(1, -1).trim();
+  if (!body) {
+    return [];
+  }
+  return splitYAMLFlowItems(body).map((item) => parseYAMLScalar(item));
+}
+
+function parseYAMLFlowMapping(value) {
+  const body = value.slice(1, -1).trim();
+  if (!body) {
+    return {};
+  }
+  const output = {};
+  for (const item of splitYAMLFlowItems(body)) {
+    const [key, itemValue] = parseYAMLKeyValue(item, 0);
+    output[key] = parseYAMLScalar(itemValue);
+  }
+  return output;
+}
+
+function splitYAMLFlowItems(value) {
+  const items = [];
+  let quote = "";
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quote) {
+      if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "[" || char === "{") {
+      depth += 1;
+      continue;
+    }
+    if (char === "]" || char === "}") {
+      depth -= 1;
+      continue;
+    }
+    if (char === "," && depth === 0) {
+      items.push(value.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  items.push(value.slice(start).trim());
+  return items.filter(Boolean);
+}
+
+function unquoteYAMLString(value) {
+  const text = String(value || "");
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
+    return JSON.parse(text);
+  }
+  if (text.length >= 2 && text.startsWith("'") && text.endsWith("'")) {
+    return text.slice(1, -1).replace(/''/g, "'");
+  }
+  return text;
 }
 
 function recordDebug(lines, env, secrets, label, value) {
