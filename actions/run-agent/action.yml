@@ -11,6 +11,8 @@ outputs:
     description: Path to the graph update draft JSON emitted by a planning run.
   pull_requests_path:
     description: Path to the pull request event JSON array emitted by a coding run.
+  debug_artifact_path:
+    description: Path to sanitized debug diagnostics emitted when debug mode is enabled.
 runs:
   using: node24
   main: index.js
