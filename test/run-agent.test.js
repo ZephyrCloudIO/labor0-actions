@@ -8,6 +8,7 @@ const test = require("node:test");
 const { isDebugMode } = require("../actions/lib/core");
 const {
   graphUpdateDraftFromOutput,
+  prepareClaudeCodeAuthentication,
   prepareCodexAuthentication,
   prepareOpenCodeAuthentication,
   runtimeAuthStatus,
@@ -92,9 +93,57 @@ test("opencode command passes model and permission bypass", () => {
 test("runtime auth validation reports missing provider credentials", () => {
   assert.deepEqual(runtimeAuthStatus("codex", {}), {
     ok: false,
-    missing: ["OPENAI_API_KEY"],
+    missing: [
+      "OPENAI_API_KEY",
+      "CODEX_API_KEY",
+      "CODEX_AGENT_IDENTITY",
+      "CODEX_AUTH_JSON_CONTENT",
+      "CODEX_CONFIG_CONTENT",
+    ],
   });
-  assert.deepEqual(runtimeAuthStatus("claude_code", { ANTHROPIC_AUTH_TOKEN: "token" }), {
+  assert.deepEqual(runtimeAuthStatus("codex", { CODEX_AUTH_JSON_CONTENT: "{}" }), {
+    ok: true,
+    missing: [],
+  });
+  assert.deepEqual(runtimeAuthStatus("claude_code", { CLAUDE_CODE_OAUTH_TOKEN: "token" }), {
+    ok: true,
+    missing: [],
+  });
+  assert.deepEqual(
+    runtimeAuthStatus("claude_code", {
+      CLAUDE_CODE_USE_BEDROCK: "1",
+      AWS_REGION: "us-east-1",
+      AWS_BEARER_TOKEN_BEDROCK: "token",
+    }),
+    {
+      ok: true,
+      missing: [],
+    },
+  );
+  assert.deepEqual(
+    runtimeAuthStatus("claude_code", {
+      CLAUDE_CODE_USE_VERTEX: "1",
+      ANTHROPIC_VERTEX_PROJECT_ID: "project",
+      CLOUD_ML_REGION: "global",
+      GOOGLE_APPLICATION_CREDENTIALS_JSON: "{}",
+    }),
+    {
+      ok: true,
+      missing: [],
+    },
+  );
+  assert.deepEqual(
+    runtimeAuthStatus("claude_code", {
+      CLAUDE_CODE_USE_FOUNDRY: "true",
+      ANTHROPIC_FOUNDRY_BASE_URL: "https://foundry.example/anthropic",
+      ANTHROPIC_FOUNDRY_API_KEY: "token",
+    }),
+    {
+      ok: true,
+      missing: [],
+    },
+  );
+  assert.deepEqual(runtimeAuthStatus("opencode", { OPENCODE_AUTH_CONTENT: "{}" }), {
     ok: true,
     missing: [],
   });
@@ -104,7 +153,7 @@ test("runtime auth validation reports missing provider credentials", () => {
   });
   assert.throws(
     () => validateRuntimeAuth({ agent_runtime_type: "opencode" }, {}),
-    /OPENAI_API_KEY or ANTHROPIC_API_KEY or OPENCODE_CONFIG_CONTENT/,
+    /OPENCODE_AUTH_CONTENT or OPENCODE_CONFIG_CONTENT/,
   );
 });
 
@@ -128,6 +177,70 @@ test("codex auth preparation uses a temporary CODEX_HOME and stdin login", () =>
   assert.equal(calls[0].options.input, "sk-test\n");
 });
 
+test("codex auth preparation writes explicit config and auth JSON without API key login", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-codex-content-test-"));
+  const calls = [];
+  const env = {
+    OPENAI_API_KEY: "sk-test",
+    CODEX_CONFIG_CONTENT: 'model_provider = "openai"\n',
+    CODEX_AUTH_JSON_CONTENT: '{"auth_mode":"apiKey","OPENAI_API_KEY":"sk-test"}',
+  };
+
+  const codexHome = prepareCodexAuthentication(env, {
+    tempDir,
+    runner: (command, args, options) => {
+      calls.push({ command, args, options });
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  assert.equal(fs.readFileSync(path.join(codexHome, "config.toml"), "utf8"), 'model_provider = "openai"\n');
+  assert.equal(
+    fs.readFileSync(path.join(codexHome, "auth.json"), "utf8"),
+    '{"auth_mode":"apiKey","OPENAI_API_KEY":"sk-test"}',
+  );
+  assert.equal(env.CODEX_CONFIG_CONTENT, undefined);
+  assert.equal(env.CODEX_AUTH_JSON_CONTENT, undefined);
+  assert.deepEqual(calls, []);
+});
+
+test("claude auth preparation writes content variables to temporary files", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-claude-content-test-"));
+  const env = {
+    GOOGLE_APPLICATION_CREDENTIALS_JSON: '{"type":"service_account"}',
+    CLAUDE_CODE_CLIENT_CERT_CONTENT: "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n",
+    CLAUDE_CODE_CLIENT_KEY_CONTENT: "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+  };
+
+  const prepared = prepareClaudeCodeAuthentication(env, { tempDir });
+
+  assert.equal(fs.readFileSync(prepared.googleApplicationCredentials, "utf8"), '{"type":"service_account"}');
+  assert.equal(fs.readFileSync(prepared.clientCert, "utf8"), "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n");
+  assert.equal(fs.readFileSync(prepared.clientKey, "utf8"), "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n");
+  assert.equal(env.GOOGLE_APPLICATION_CREDENTIALS_JSON, undefined);
+  assert.equal(env.CLAUDE_CODE_CLIENT_CERT_CONTENT, undefined);
+  assert.equal(env.CLAUDE_CODE_CLIENT_KEY_CONTENT, undefined);
+});
+
+test("claude auth preparation exchanges refresh token credentials", () => {
+  const calls = [];
+  const env = {
+    CLAUDE_CODE_OAUTH_REFRESH_TOKEN: "refresh-token",
+    CLAUDE_CODE_OAUTH_SCOPES: "user:profile user:inference user:sessions:claude_code",
+  };
+
+  prepareClaudeCodeAuthentication(env, {
+    runner: (command, args, options) => {
+      calls.push({ command, args, options });
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  assert.equal(calls[0].command, "claude");
+  assert.deepEqual(calls[0].args, ["auth", "login"]);
+  assert.equal(calls[0].options.env, env);
+});
+
 test("opencode auth preparation synthesizes env-substituted provider config", () => {
   const env = {
     ANTHROPIC_API_KEY: "sk-ant",
@@ -147,6 +260,18 @@ test("opencode auth preparation synthesizes env-substituted provider config", ()
     $schema: "https://opencode.ai/config.json",
     provider: {},
   });
+});
+
+test("opencode auth preparation preserves explicit config and auth content", () => {
+  const env = {
+    OPENCODE_AUTH_CONTENT: '{"openai":{"type":"api","key":"sk-test"}}',
+    OPENCODE_CONFIG_CONTENT: '{"$schema":"https://opencode.ai/config.json","model":"openai/gpt-5.4"}',
+  };
+
+  const content = prepareOpenCodeAuthentication(env);
+
+  assert.equal(content, env.OPENCODE_CONFIG_CONTENT);
+  assert.equal(env.OPENCODE_AUTH_CONTENT, '{"openai":{"type":"api","key":"sk-test"}}');
 });
 
 test("graph update draft extraction accepts stdout around JSON", () => {

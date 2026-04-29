@@ -250,23 +250,137 @@ function validateRuntimeAuth(manifest, env) {
 }
 
 function runtimeAuthStatus(runtimeType, env) {
-  const has = (key) => String(env[key] || "").trim().length > 0;
   switch (runtimeType) {
     case "codex":
-      return has("OPENAI_API_KEY")
+      return hasAny(env, [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_AGENT_IDENTITY",
+        "CODEX_AUTH_JSON_CONTENT",
+        "CODEX_CONFIG_CONTENT",
+      ])
         ? { ok: true, missing: [] }
-        : { ok: false, missing: ["OPENAI_API_KEY"] };
+        : {
+            ok: false,
+            missing: [
+              "OPENAI_API_KEY",
+              "CODEX_API_KEY",
+              "CODEX_AGENT_IDENTITY",
+              "CODEX_AUTH_JSON_CONTENT",
+              "CODEX_CONFIG_CONTENT",
+            ],
+          };
     case "claude_code":
-      return has("ANTHROPIC_API_KEY") || has("ANTHROPIC_AUTH_TOKEN")
+      return hasClaudeCodeAuthentication(env)
         ? { ok: true, missing: [] }
-        : { ok: false, missing: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] };
+        : {
+            ok: false,
+            missing: [
+              "direct Anthropic API key/token",
+              "Claude Code OAuth token",
+              "Claude Code OAuth refresh token and scopes",
+              "Bedrock/Mantle credentials",
+              "Vertex credentials",
+              "Foundry credentials",
+            ],
+          };
     case "opencode":
-      return has("OPENAI_API_KEY") || has("ANTHROPIC_API_KEY") || has("OPENCODE_CONFIG_CONTENT")
+      return hasOpenCodeAuthentication(env)
         ? { ok: true, missing: [] }
-        : { ok: false, missing: ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENCODE_CONFIG_CONTENT"] };
+        : {
+            ok: false,
+            missing: [
+              "OPENCODE_AUTH_CONTENT",
+              "OPENCODE_CONFIG_CONTENT",
+              "OPENAI_API_KEY",
+              "ANTHROPIC_API_KEY",
+              "supported AWS/GCP provider credentials",
+            ],
+          };
     default:
       throw new Error(`Unsupported agent_runtime_type: ${runtimeType || "(empty)"}`);
   }
+}
+
+function has(env, key) {
+  return String(env[key] || "").trim().length > 0;
+}
+
+function hasAny(env, keys) {
+  return keys.some((key) => has(env, key));
+}
+
+function hasFlag(env, key) {
+  const value = String(env[key] || "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+function hasClaudeCodeAuthentication(env) {
+  if (hasAny(env, ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"])) {
+    return true;
+  }
+  if (has(env, "CLAUDE_CODE_OAUTH_REFRESH_TOKEN") && has(env, "CLAUDE_CODE_OAUTH_SCOPES")) {
+    return true;
+  }
+  if (hasFlag(env, "CLAUDE_CODE_USE_BEDROCK") && hasAWSRuntimeAuthentication(env)) {
+    return true;
+  }
+  if (hasFlag(env, "CLAUDE_CODE_USE_MANTLE")) {
+    if (hasFlag(env, "CLAUDE_CODE_SKIP_MANTLE_AUTH") && has(env, "ANTHROPIC_BEDROCK_MANTLE_BASE_URL")) {
+      return true;
+    }
+    if (hasAWSRuntimeAuthentication(env)) {
+      return true;
+    }
+  }
+  if (hasFlag(env, "CLAUDE_CODE_USE_VERTEX") && hasClaudeCodeVertexAuthentication(env)) {
+    return true;
+  }
+  if (hasFlag(env, "CLAUDE_CODE_USE_FOUNDRY") && hasClaudeCodeFoundryAuthentication(env)) {
+    return true;
+  }
+  return false;
+}
+
+function hasOpenCodeAuthentication(env) {
+  if (hasAny(env, ["OPENCODE_AUTH_CONTENT", "OPENCODE_CONFIG_CONTENT", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"])) {
+    return true;
+  }
+  return hasAWSRuntimeAuthentication(env) || hasGoogleRuntimeAuthentication(env);
+}
+
+function hasAWSRuntimeAuthentication(env) {
+  if (!has(env, "AWS_REGION")) {
+    return false;
+  }
+  if (has(env, "AWS_BEARER_TOKEN_BEDROCK")) {
+    return true;
+  }
+  if (has(env, "AWS_ACCESS_KEY_ID") && has(env, "AWS_SECRET_ACCESS_KEY")) {
+    return true;
+  }
+  if (has(env, "AWS_PROFILE")) {
+    return true;
+  }
+  return has(env, "AWS_WEB_IDENTITY_TOKEN_FILE") && has(env, "AWS_ROLE_ARN");
+}
+
+function hasGoogleRuntimeAuthentication(env) {
+  return hasAny(env, ["GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_APPLICATION_CREDENTIALS_JSON"]);
+}
+
+function hasClaudeCodeVertexAuthentication(env) {
+  return has(env, "ANTHROPIC_VERTEX_PROJECT_ID") && has(env, "CLOUD_ML_REGION") && hasGoogleRuntimeAuthentication(env);
+}
+
+function hasClaudeCodeFoundryAuthentication(env) {
+  if (!hasAny(env, ["ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL"])) {
+    return false;
+  }
+  if (has(env, "ANTHROPIC_FOUNDRY_API_KEY")) {
+    return true;
+  }
+  return has(env, "AZURE_CLIENT_ID") && has(env, "AZURE_TENANT_ID") && has(env, "AZURE_CLIENT_SECRET");
 }
 
 function prepareRuntimeAuthentication(manifest, env, options = {}) {
@@ -276,7 +390,7 @@ function prepareRuntimeAuthentication(manifest, env, options = {}) {
     case "opencode":
       return prepareOpenCodeAuthentication(env);
     case "claude_code":
-      return null;
+      return prepareClaudeCodeAuthentication(env, options);
     default:
       throw new Error(`Unsupported agent_runtime_type: ${manifest.agent_runtime_type || "(empty)"}`);
   }
@@ -286,16 +400,80 @@ function prepareCodexAuthentication(env, options = {}) {
   const tempDir = options.tempDir || process.env.RUNNER_TEMP || process.cwd();
   const runner = options.runner || run;
   const codexHome = fs.mkdtempSync(path.join(tempDir, "labor0-codex-home-"));
-  fs.writeFileSync(path.join(codexHome, "config.toml"), 'forced_login_method = "api"\n', {
-    mode: 0o600,
-  });
   env.CODEX_HOME = codexHome;
-  runner("codex", ["login", "--with-api-key"], {
-    capture: true,
-    env,
-    input: `${env.OPENAI_API_KEY}\n`,
-  });
+  const runAPIKeyLogin = shouldRunCodexAPIKeyLogin(env);
+  if (has(env, "CODEX_CONFIG_CONTENT")) {
+    writeSecretFile(path.join(codexHome, "config.toml"), env.CODEX_CONFIG_CONTENT);
+    delete env.CODEX_CONFIG_CONTENT;
+  } else if (runAPIKeyLogin) {
+    writeSecretFile(path.join(codexHome, "config.toml"), 'forced_login_method = "api"\n');
+  }
+  if (has(env, "CODEX_AUTH_JSON_CONTENT")) {
+    writeSecretFile(path.join(codexHome, "auth.json"), env.CODEX_AUTH_JSON_CONTENT);
+    delete env.CODEX_AUTH_JSON_CONTENT;
+  }
+  if (runAPIKeyLogin) {
+    runner("codex", ["login", "--with-api-key"], {
+      capture: true,
+      env,
+      input: `${env.OPENAI_API_KEY}\n`,
+    });
+  }
   return codexHome;
+}
+
+function shouldRunCodexAPIKeyLogin(env) {
+  return (
+    has(env, "OPENAI_API_KEY") &&
+    !hasAny(env, ["CODEX_API_KEY", "CODEX_AGENT_IDENTITY", "CODEX_AUTH_JSON_CONTENT", "CODEX_CONFIG_CONTENT"])
+  );
+}
+
+function prepareClaudeCodeAuthentication(env, options = {}) {
+  const tempDir = options.tempDir || process.env.RUNNER_TEMP || process.cwd();
+  const runner = options.runner || run;
+  if (has(env, "GOOGLE_APPLICATION_CREDENTIALS_JSON")) {
+    env.GOOGLE_APPLICATION_CREDENTIALS = writeTempSecretFile(
+      tempDir,
+      "labor0-google-credentials-",
+      "credentials.json",
+      env.GOOGLE_APPLICATION_CREDENTIALS_JSON,
+    );
+    delete env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  }
+  if (has(env, "CLAUDE_CODE_CLIENT_CERT_CONTENT")) {
+    env.CLAUDE_CODE_CLIENT_CERT = writeTempSecretFile(
+      tempDir,
+      "labor0-claude-client-cert-",
+      "client-cert.pem",
+      env.CLAUDE_CODE_CLIENT_CERT_CONTENT,
+    );
+    delete env.CLAUDE_CODE_CLIENT_CERT_CONTENT;
+  }
+  if (has(env, "CLAUDE_CODE_CLIENT_KEY_CONTENT")) {
+    env.CLAUDE_CODE_CLIENT_KEY = writeTempSecretFile(
+      tempDir,
+      "labor0-claude-client-key-",
+      "client-key.pem",
+      env.CLAUDE_CODE_CLIENT_KEY_CONTENT,
+    );
+    delete env.CLAUDE_CODE_CLIENT_KEY_CONTENT;
+  }
+  if (
+    !has(env, "CLAUDE_CODE_OAUTH_TOKEN") &&
+    has(env, "CLAUDE_CODE_OAUTH_REFRESH_TOKEN") &&
+    has(env, "CLAUDE_CODE_OAUTH_SCOPES")
+  ) {
+    runner("claude", ["auth", "login"], {
+      capture: true,
+      env,
+    });
+  }
+  return {
+    googleApplicationCredentials: env.GOOGLE_APPLICATION_CREDENTIALS || "",
+    clientCert: env.CLAUDE_CODE_CLIENT_CERT || "",
+    clientKey: env.CLAUDE_CODE_CLIENT_KEY || "",
+  };
 }
 
 function prepareOpenCodeAuthentication(env) {
@@ -329,6 +507,17 @@ function synthesizeOpenCodeConfig(env) {
     $schema: "https://opencode.ai/config.json",
     provider,
   };
+}
+
+function writeTempSecretFile(tempDir, directoryPrefix, filename, content) {
+  const directory = fs.mkdtempSync(path.join(tempDir, directoryPrefix));
+  const filePath = path.join(directory, filename);
+  writeSecretFile(filePath, content);
+  return filePath;
+}
+
+function writeSecretFile(filePath, content) {
+  fs.writeFileSync(filePath, content, { mode: 0o600 });
 }
 
 function runtimeLabel(runtimeType) {
@@ -738,6 +927,7 @@ module.exports = {
   graphUpdateDraftFromOutput,
   graphUpdateDraftCandidate,
   manifestSecretValues,
+  prepareClaudeCodeAuthentication,
   prepareCodexAuthentication,
   prepareOpenCodeAuthentication,
   prepareRuntimeAuthentication,
