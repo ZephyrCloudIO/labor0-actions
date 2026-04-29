@@ -16,6 +16,9 @@ function readManifest(filePath) {
 
 function maskManifestSecrets(manifest) {
   addMask(manifest.prompt);
+  for (const value of Object.values(manifest.agent_runtime_environment || {})) {
+    addMask(value);
+  }
   for (const repository of manifest.repositories || []) {
     addMask(repository.token);
     addMask(repository.access_token);

@@ -1,5 +1,6 @@
 "use strict";
 
+const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
 const { fail, getInput, info, setOutput, writeJSON } = require("../lib/core");
@@ -8,31 +9,54 @@ const { redact } = require("../lib/redaction");
 
 function main() {
   const manifest = readManifest(getInput("manifest_path", { required: true }));
-  const resultPath = path.join(process.env.RUNNER_TEMP || process.cwd(), "labor0-agent-task-result.json");
-  const command = runtimeCommand(manifest);
+  const tempDir = process.env.RUNNER_TEMP || process.cwd();
+  const resultPath = path.join(tempDir, "labor0-agent-task-result.json");
+  const graphUpdateDraftPath = path.join(tempDir, "labor0-graph-update-draft.json");
+  const graphUpdateSchemaPath = path.join(tempDir, "labor0-graph-update-draft.schema.json");
+  const pullRequestsPath = path.join(tempDir, "labor0-agent-task-pull-requests.json");
+
+  installRuntime(manifest.agent_runtime_type);
+  if (manifest.agent_task_purpose === "graph_update") {
+    writeJSON(graphUpdateSchemaPath, graphUpdateDraftSchema());
+  }
+  const command = runtimeCommand(manifest, { graphUpdateSchemaPath });
+  const cwd = process.env.GITHUB_WORKSPACE || process.cwd();
+  const env = agentEnvironment(manifest);
   info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
   const startedAt = new Date();
   const result = spawnSync(command[0], command.slice(1), {
-    cwd: process.env.GITHUB_WORKSPACE || process.cwd(),
-    env: {
-      ...process.env,
-      LABOR0_AGENT_TASK_SESSION_ID: manifest.agent_task_session_id,
-      LABOR0_AGENT_TASK_ID: manifest.agent_task_id,
-      LABOR0_GRAPH_AGENT_TASK_ID: manifest.graph_agent_task_id,
-      LABOR0_AGENT_TASK_PURPOSE: manifest.agent_task_purpose || "",
-      LABOR0_AGENT_RUNTIME_TYPE: manifest.agent_runtime_type || "",
-      LABOR0_AGENT_PROMPT: manifest.prompt || "",
-    },
+    cwd,
+    env,
     encoding: "utf8",
     maxBuffer: 20 * 1024 * 1024,
   });
   const endedAt = new Date();
+
+  let graphUpdateDraft = null;
+  if (manifest.agent_task_purpose === "graph_update" && result.status === 0) {
+    graphUpdateDraft = graphUpdateDraftFromOutput(manifest, result.stdout || "");
+    writeJSON(graphUpdateDraftPath, graphUpdateDraft);
+    setOutput("graph_update_draft_path", graphUpdateDraftPath);
+  }
+
+  const pullRequests =
+    result.status === 0 && manifest.agent_task_purpose === "coding"
+      ? createPullRequestsForChangedRepositories(manifest)
+      : [];
+  if (pullRequests.length > 0) {
+    writeJSON(pullRequestsPath, pullRequests);
+    setOutput("pull_requests_path", pullRequestsPath);
+  }
+
   const output = {
     agent_task_session_id: manifest.agent_task_session_id,
     agent_task_id: manifest.agent_task_id,
     graph_agent_task_id: manifest.graph_agent_task_id,
     agent_task_purpose: manifest.agent_task_purpose,
     agent_runtime_type: manifest.agent_runtime_type,
+    agent_model: manifest.agent_model || "",
+    graph_update_draft_created: Boolean(graphUpdateDraft),
+    pull_request_count: pullRequests.length,
     exit_code: result.status ?? 1,
     signal: result.signal,
     started_at: startedAt.toISOString(),
@@ -47,25 +71,335 @@ function main() {
   }
 }
 
-function runtimeCommand(manifest) {
-  if (process.env.LABOR0_AGENT_COMMAND) {
-    return shellCommand(process.env.LABOR0_AGENT_COMMAND, manifest.prompt || "");
+function agentEnvironment(manifest) {
+  return {
+    ...process.env,
+    ...(manifest.agent_runtime_environment || {}),
+    LABOR0_AGENT_TASK_SESSION_ID: manifest.agent_task_session_id,
+    LABOR0_AGENT_TASK_ID: manifest.agent_task_id,
+    LABOR0_GRAPH_AGENT_TASK_ID: manifest.graph_agent_task_id,
+    LABOR0_AGENT_TASK_PURPOSE: manifest.agent_task_purpose || "",
+    LABOR0_AGENT_RUNTIME_TYPE: manifest.agent_runtime_type || "",
+    LABOR0_AGENT_MODEL: manifest.agent_model || "",
+    LABOR0_AGENT_PROMPT: manifest.prompt || "",
+  };
+}
+
+function installRuntime(runtimeType) {
+  switch (runtimeType) {
+    case "codex":
+      installNpmPackageIfMissing("codex", "@openai/codex");
+      break;
+    case "claude_code":
+      installNpmPackageIfMissing("claude", "@anthropic-ai/claude-code");
+      break;
+    case "opencode":
+      break;
+    default:
+      throw new Error(`Unsupported agent_runtime_type: ${runtimeType || "(empty)"}`);
   }
+}
+
+function installNpmPackageIfMissing(binary, packageName) {
+  if (commandExists(binary)) {
+    return;
+  }
+  info(`Installing ${packageName}`);
+  run("npm", ["i", "-g", packageName], { cwd: process.cwd() });
+}
+
+function commandExists(binary) {
+  return spawnSync(binary, ["--version"], { encoding: "utf8" }).status === 0;
+}
+
+function runtimeCommand(manifest, options = {}) {
+  const prompt = runtimePrompt(manifest);
+  if (process.env.LABOR0_AGENT_COMMAND) {
+    return shellCommand(process.env.LABOR0_AGENT_COMMAND);
+  }
+  const graphUpdateSchemaPath =
+    manifest.agent_task_purpose === "graph_update" ? options.graphUpdateSchemaPath : "";
   switch (manifest.agent_runtime_type) {
     case "codex":
-      return ["codex", "exec", "--ask-for-approval", "never", "--sandbox", "danger-full-access", manifest.prompt || ""];
+      return compact([
+        "codex",
+        "exec",
+        "--full-auto",
+        "--sandbox",
+        "danger-full-access",
+        "--skip-git-repo-check",
+        graphUpdateSchemaPath ? "--output-schema" : "",
+        graphUpdateSchemaPath,
+        manifest.agent_model ? "--model" : "",
+        manifest.agent_model || "",
+        prompt,
+      ]);
     case "claude_code":
-      return ["claude", "--print", manifest.prompt || ""];
+      return compact([
+        "claude",
+        "-p",
+        "--permission-mode",
+        "bypassPermissions",
+        graphUpdateSchemaPath ? "--json-schema" : "",
+        graphUpdateSchemaPath ? JSON.stringify(graphUpdateDraftSchema()) : "",
+        manifest.agent_model ? "--model" : "",
+        manifest.agent_model || "",
+        prompt,
+      ]);
     case "opencode":
-      return ["opencode", "run", manifest.prompt || ""];
+      return compact(["opencode", "run", prompt]);
     default:
       throw new Error(`Unsupported agent_runtime_type: ${manifest.agent_runtime_type || "(empty)"}`);
   }
 }
 
-function shellCommand(command, prompt) {
-  void prompt;
+function graphUpdateDraftSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["summary", "task_drafts", "upsert_edges", "remove_edges"],
+    properties: {
+      summary: { type: "string" },
+      task_drafts: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "object",
+          additionalProperties: true,
+          required: ["draft_task_key", "task_type", "title", "description", "execution_repository_bindings"],
+          properties: {
+            draft_task_key: { type: "string" },
+            task_type: { type: "string" },
+            title: { type: "string" },
+            description: { type: "string" },
+            labels: {
+              type: "array",
+              items: { type: "string" },
+            },
+            execution_repository_bindings: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: true,
+                required: ["repository_id", "selected_ref", "access_mode"],
+                properties: {
+                  repository_id: { type: "string" },
+                  selected_ref: { type: "string" },
+                  access_mode: { type: "string" },
+                  auto_pull_request_enabled: { type: "boolean" },
+                },
+              },
+            },
+          },
+        },
+      },
+      upsert_edges: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: true,
+        },
+      },
+      remove_edges: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: true,
+        },
+      },
+    },
+  };
+}
+
+function runtimePrompt(manifest) {
+  if (manifest.agent_task_purpose !== "graph_update") {
+    return manifest.prompt || "";
+  }
+  return `${manifest.prompt || ""}
+
+Return only one JSON object matching this shape:
+{
+  "summary": "short summary",
+  "task_drafts": [
+    {
+      "draft_task_key": "stable-kebab-key",
+      "task_type": "agent_execution",
+      "title": "task title",
+      "description": "task details",
+      "labels": ["label"],
+      "execution_repository_bindings": [
+        {
+          "repository_id": "uuid from the manifest repositories list",
+          "selected_ref": "refs/heads/main",
+          "access_mode": "read_write",
+          "auto_pull_request_enabled": true
+        }
+      ]
+    }
+  ],
+  "upsert_edges": [],
+  "remove_edges": []
+}
+Do not wrap the JSON in Markdown.`;
+}
+
+function shellCommand(command) {
   return ["bash", "-lc", command];
+}
+
+function graphUpdateDraftFromOutput(manifest, stdout) {
+  const parsed = extractJSONObject(stdout);
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("graph_update task did not produce a JSON draft");
+  }
+  if (!Array.isArray(parsed.task_drafts) || parsed.task_drafts.length === 0) {
+    throw new Error("graph_update draft must include task_drafts");
+  }
+  return {
+    source_agent_task_session_id: manifest.agent_task_session_id,
+    summary: String(parsed.summary || ""),
+    task_drafts: parsed.task_drafts,
+    upsert_edges: Array.isArray(parsed.upsert_edges) ? parsed.upsert_edges : [],
+    remove_edges: Array.isArray(parsed.remove_edges) ? parsed.remove_edges : [],
+  };
+}
+
+function extractJSONObject(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const first = trimmed.indexOf("{");
+    const last = trimmed.lastIndexOf("}");
+    if (first === -1 || last <= first) {
+      return null;
+    }
+    return JSON.parse(trimmed.slice(first, last + 1));
+  }
+}
+
+function createPullRequestsForChangedRepositories(manifest) {
+  const pullRequests = [];
+  for (const repository of manifest.repositories || []) {
+    if (!shouldCreatePullRequest(repository)) {
+      continue;
+    }
+    const checkoutPath = path.resolve(
+      process.env.GITHUB_WORKSPACE || process.cwd(),
+      repository.checkout_path || `repositories/${repository.repository_id}`,
+    );
+    if (!fs.existsSync(checkoutPath) || !hasChanges(checkoutPath)) {
+      continue;
+    }
+    pullRequests.push(createPullRequest(manifest, repository, checkoutPath));
+  }
+  return pullRequests;
+}
+
+function shouldCreatePullRequest(repository) {
+  return repository.access_mode === "read_write" && repository.auto_pull_request_enabled !== false;
+}
+
+function hasChanges(cwd) {
+  const result = run("git", ["status", "--porcelain"], { cwd, capture: true });
+  return result.stdout.trim().length > 0;
+}
+
+function createPullRequest(manifest, repository, cwd) {
+  const ref = parseGitHubRepository(repository.git_url);
+  if (!ref) {
+    throw new Error(`Cannot open pull request for non-GitHub repository ${repository.git_url}`);
+  }
+  const token = repository.token || repository.access_token || (repository.credential && repository.credential.token);
+  const branchName = `labor0/${shortID(manifest.agent_task_session_id)}/${shortID(repository.repository_id)}`;
+  const baseBranch = normalizeRef(repository.selected_ref);
+  const title = `chore: apply ${manifest.task_title || "Labor0 agent task"}`;
+  const body = [
+    `Labor0 agent task: ${manifest.agent_task_id}`,
+    `Session: ${manifest.agent_task_session_id}`,
+    `Runtime: ${manifest.agent_runtime_type}${manifest.agent_model ? ` (${manifest.agent_model})` : ""}`,
+  ].join("\n");
+  const env = { ...process.env, ...(token ? { GH_TOKEN: token, GITHUB_TOKEN: token } : {}) };
+
+  run("git", ["config", "user.name", "labor0-agent"], { cwd });
+  run("git", ["config", "user.email", "agent@labor0.com"], { cwd });
+  run("git", ["checkout", "-B", branchName], { cwd });
+  run("git", ["add", "-A"], { cwd });
+  run("git", ["commit", "-m", title], { cwd });
+  run("git", ["push", "-u", "origin", `HEAD:${branchName}`], { cwd });
+
+  const existing = viewPullRequest(branchName, cwd, env);
+  const pr = existing || createGitHubPullRequest(branchName, baseBranch, title, body, cwd, env);
+  return {
+    repository_id: repository.repository_id,
+    git_url: repository.git_url,
+    branch_name: branchName,
+    pull_request_ref: `github:${ref.owner}/${ref.repo}#${pr.number}`,
+    pull_request_number: pr.number,
+    pull_request_url: pr.url,
+    is_open: true,
+  };
+}
+
+function viewPullRequest(branchName, cwd, env) {
+  const result = spawnSync("gh", ["pr", "view", branchName, "--json", "number,url"], {
+    cwd,
+    env,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    return null;
+  }
+  return JSON.parse(result.stdout);
+}
+
+function createGitHubPullRequest(branchName, baseBranch, title, body, cwd, env) {
+  const create = run(
+    "gh",
+    ["pr", "create", "--title", title, "--body", body, "--base", baseBranch, "--head", branchName],
+    { cwd, env, capture: true },
+  );
+  const url = create.stdout.trim().split(/\s+/).find((item) => /^https?:\/\//.test(item)) || "";
+  const view = run("gh", ["pr", "view", url || branchName, "--json", "number,url"], {
+    cwd,
+    env,
+    capture: true,
+  });
+  return JSON.parse(view.stdout);
+}
+
+function parseGitHubRepository(gitURL) {
+  const match = String(gitURL || "").match(/^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
+  return match ? { owner: match[1], repo: match[2] } : null;
+}
+
+function normalizeRef(ref) {
+  return (ref || "main").replace(/^refs\/heads\//, "").replace(/^refs\/tags\//, "");
+}
+
+function shortID(value) {
+  return String(value || "task").replace(/[^a-zA-Z0-9]/g, "").slice(0, 12) || "task";
+}
+
+function run(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    cwd: options.cwd || process.cwd(),
+    env: options.env || process.env,
+    encoding: "utf8",
+    stdio: options.capture ? "pipe" : "inherit",
+  });
+  if (result.status !== 0) {
+    const stderr = result.stderr || "";
+    throw new Error(`${command} failed with ${result.status}: ${stderr.trim()}`);
+  }
+  return result;
+}
+
+function compact(values) {
+  return values.filter(Boolean);
 }
 
 function tail(value) {
@@ -73,8 +407,18 @@ function tail(value) {
   return value.length > max ? value.slice(value.length - max) : value;
 }
 
-try {
-  main();
-} catch (error) {
-  fail(error);
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    fail(error);
+  }
 }
+
+module.exports = {
+  extractJSONObject,
+  graphUpdateDraftSchema,
+  graphUpdateDraftFromOutput,
+  runtimeCommand,
+  shouldCreatePullRequest,
+};

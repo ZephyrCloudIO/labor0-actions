@@ -28,5 +28,9 @@ test("reusable workflow only accepts session bootstrap inputs", () => {
   assert.doesNotMatch(workflow, /prompt:/);
   assert.doesNotMatch(workflow, /provider_secret:/);
   assert.doesNotMatch(workflow, /repo_token:/);
+  assert.match(workflow, /contents:\s+write/);
   assert.match(workflow, /id-token:\s+write/);
+  assert.match(workflow, /graph_update_draft_path:/);
+  assert.match(workflow, /pull_requests_path:/);
+  assert.match(workflow, /labor0-actions\/actions\/run-agent@v1/);
 });
