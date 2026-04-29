@@ -3,79 +3,152 @@
 const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
-const { fail, getInput, info, setOutput, writeJSON } = require("../lib/core");
+const { debug, fail, getInput, info, isDebugMode, setOutput, writeJSON } = require("../lib/core");
 const { readManifest } = require("../lib/manifest");
 const { redact } = require("../lib/redaction");
 
 function main() {
   const manifest = readManifest(getInput("manifest_path", { required: true }));
-  const tempDir = process.env.RUNNER_TEMP || process.cwd();
+  runAgent(manifest);
+}
+
+function runAgent(manifest, options = {}) {
+  const baseEnv = options.env || process.env;
+  const tempDir = options.tempDir || baseEnv.RUNNER_TEMP || process.cwd();
   const resultPath = path.join(tempDir, "labor0-agent-task-result.json");
+  const debugArtifactPath = path.join(tempDir, "labor0-agent-debug-diagnostics.json");
   const graphUpdateDraftPath = path.join(tempDir, "labor0-graph-update-draft.json");
   const graphUpdateSchemaPath = path.join(tempDir, "labor0-graph-update-draft.schema.json");
   const pullRequestsPath = path.join(tempDir, "labor0-agent-task-pull-requests.json");
+  const emitOutput = options.setOutput || setOutput;
+  const debugEnabled = isDebugMode(baseEnv);
+  const secrets = manifestSecretValues(manifest);
+  const debugLines = [];
 
-  const env = agentEnvironment(manifest);
-  validateRuntimeAuth(manifest, env);
-  installRuntime(manifest.agent_runtime_type);
-  prepareRuntimeAuthentication(manifest, env, { tempDir });
-  if (manifest.agent_task_purpose === "graph_update") {
-    writeJSON(graphUpdateSchemaPath, graphUpdateDraftSchema());
-  }
-  const command = runtimeCommand(manifest, { graphUpdateSchemaPath });
-  const cwd = process.env.GITHUB_WORKSPACE || process.cwd();
-  info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
+  let command = [];
+  let graphUpdateDraft = null;
+  let pullRequests = [];
+  let result = { status: 1, signal: null, stdout: "", stderr: "" };
+  let draftParseError = "";
+  let runError = null;
   const startedAt = new Date();
-  const result = spawnSync(command[0], command.slice(1), {
-    cwd,
-    env,
-    encoding: "utf8",
-    maxBuffer: 20 * 1024 * 1024,
-  });
+
+  try {
+    const env = agentEnvironment(manifest, baseEnv);
+    const runtimeValidator = options.validateRuntimeAuth || validateRuntimeAuth;
+    const runtimeInstaller = options.installRuntime || installRuntime;
+    const runtimeAuthPreparer = options.prepareRuntimeAuthentication || prepareRuntimeAuthentication;
+    runtimeValidator(manifest, env);
+    runtimeInstaller(manifest.agent_runtime_type);
+    runtimeAuthPreparer(manifest, env, { tempDir });
+    if (manifest.agent_task_purpose === "graph_update") {
+      writeJSON(graphUpdateSchemaPath, graphUpdateDraftSchema());
+    }
+    command = runtimeCommand(manifest, { graphUpdateSchemaPath, env: baseEnv });
+    const cwd = options.cwd || baseEnv.GITHUB_WORKSPACE || process.cwd();
+    recordDebug(debugLines, baseEnv, secrets, "manifest", manifestDebugSummary(manifest));
+    recordDebug(debugLines, baseEnv, secrets, "runtime command", commandForDebug(command, manifest, secrets));
+    info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
+    const spawner = options.spawnSync || spawnSync;
+    result = spawner(command[0], command.slice(1), {
+      cwd,
+      env,
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    recordDebug(debugLines, baseEnv, secrets, "runtime result", runtimeResultSummary(result));
+    recordDebug(debugLines, baseEnv, secrets, "runtime output tail", {
+      stdout_tail: sanitizeText(tail(result.stdout || "", 4000), secrets),
+      stderr_tail: sanitizeText(tail(result.stderr || "", 4000), secrets),
+    });
+
+    if (manifest.agent_task_purpose === "graph_update" && result.status === 0) {
+      try {
+        graphUpdateDraft = graphUpdateDraftFromOutput(manifest, result.stdout || "");
+        writeJSON(graphUpdateDraftPath, graphUpdateDraft);
+        emitOutput("graph_update_draft_path", graphUpdateDraftPath);
+      } catch (error) {
+        draftParseError = error instanceof Error ? error.message : String(error);
+        runError = error;
+        recordDebug(debugLines, baseEnv, secrets, "graph update draft parse error", draftParseError);
+      }
+    }
+
+    if (!runError && result.status === 0 && manifest.agent_task_purpose === "coding") {
+      const pullRequestCreator = options.createPullRequestsForChangedRepositories || createPullRequestsForChangedRepositories;
+      pullRequests = pullRequestCreator(manifest);
+      if (pullRequests.length > 0) {
+        writeJSON(pullRequestsPath, pullRequests);
+        emitOutput("pull_requests_path", pullRequestsPath);
+      }
+    }
+  } catch (error) {
+    runError = error;
+    recordDebug(
+      debugLines,
+      baseEnv,
+      secrets,
+      "run error",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
   const endedAt = new Date();
 
-  let graphUpdateDraft = null;
-  if (manifest.agent_task_purpose === "graph_update" && result.status === 0) {
-    graphUpdateDraft = graphUpdateDraftFromOutput(manifest, result.stdout || "");
-    writeJSON(graphUpdateDraftPath, graphUpdateDraft);
-    setOutput("graph_update_draft_path", graphUpdateDraftPath);
-  }
-
-  const pullRequests =
-    result.status === 0 && manifest.agent_task_purpose === "coding"
-      ? createPullRequestsForChangedRepositories(manifest)
-      : [];
-  if (pullRequests.length > 0) {
-    writeJSON(pullRequestsPath, pullRequests);
-    setOutput("pull_requests_path", pullRequestsPath);
-  }
-
-  const output = {
+  const output = redact({
     agent_task_session_id: manifest.agent_task_session_id,
     agent_task_id: manifest.agent_task_id,
     graph_agent_task_id: manifest.graph_agent_task_id,
     agent_task_purpose: manifest.agent_task_purpose,
     agent_runtime_type: manifest.agent_runtime_type,
     agent_model: manifest.agent_model || "",
+    debug_enabled: debugEnabled,
     graph_update_draft_created: Boolean(graphUpdateDraft),
     pull_request_count: pullRequests.length,
     exit_code: result.status ?? 1,
     signal: result.signal,
     started_at: startedAt.toISOString(),
     ended_at: endedAt.toISOString(),
-    stdout_tail: tail(result.stdout || ""),
-    stderr_tail: tail(result.stderr || ""),
-  };
-  writeJSON(resultPath, redact(output));
-  setOutput("result_path", resultPath);
+    duration_ms: endedAt.getTime() - startedAt.getTime(),
+    stdout_bytes: byteLength(result.stdout || ""),
+    stderr_bytes: byteLength(result.stderr || ""),
+    stdout_tail: sanitizeText(tail(result.stdout || ""), secrets),
+    stderr_tail: sanitizeText(tail(result.stderr || ""), secrets),
+    draft_parse_error: draftParseError || undefined,
+    error_message: runError ? sanitizeText(runError instanceof Error ? runError.message : String(runError), secrets) : undefined,
+  });
+  writeJSON(resultPath, output);
+  emitOutput("result_path", resultPath);
+
+  if (debugEnabled) {
+    writeJSON(
+      debugArtifactPath,
+      redact({
+        manifest: manifestDebugSummary(manifest),
+        command: commandForDebug(command, manifest, secrets),
+        result: output,
+        debug_lines: debugLines,
+      }),
+    );
+    emitOutput("debug_artifact_path", debugArtifactPath);
+  }
+  if (runError) {
+    throw runError;
+  }
   if (result.status !== 0) {
     throw new Error(`${command[0]} exited with ${result.status ?? result.signal}`);
   }
+  return {
+    resultPath,
+    debugArtifactPath: debugEnabled ? debugArtifactPath : "",
+    graphUpdateDraftPath: graphUpdateDraft ? graphUpdateDraftPath : "",
+    pullRequestsPath: pullRequests.length > 0 ? pullRequestsPath : "",
+    output,
+  };
 }
 
-function agentEnvironment(manifest) {
+function agentEnvironment(manifest, baseEnv = process.env) {
   return {
-    ...process.env,
+    ...baseEnv,
     ...(manifest.agent_runtime_environment || {}),
     LABOR0_AGENT_TASK_SESSION_ID: manifest.agent_task_session_id,
     LABOR0_AGENT_TASK_ID: manifest.agent_task_id,
@@ -117,8 +190,9 @@ function commandExists(binary) {
 
 function runtimeCommand(manifest, options = {}) {
   const prompt = runtimePrompt(manifest);
-  if (process.env.LABOR0_AGENT_COMMAND) {
-    return shellCommand(process.env.LABOR0_AGENT_COMMAND);
+  const env = options.env || process.env;
+  if (env.LABOR0_AGENT_COMMAND) {
+    return shellCommand(env.LABOR0_AGENT_COMMAND);
   }
   const graphUpdateSchemaPath =
     manifest.agent_task_purpose === "graph_update" ? options.graphUpdateSchemaPath : "";
@@ -143,6 +217,8 @@ function runtimeCommand(manifest, options = {}) {
         "-p",
         "--permission-mode",
         "bypassPermissions",
+        graphUpdateSchemaPath ? "--output-format" : "",
+        graphUpdateSchemaPath ? "json" : "",
         graphUpdateSchemaPath ? "--json-schema" : "",
         graphUpdateSchemaPath ? JSON.stringify(graphUpdateDraftSchema()) : "",
         manifest.agent_model ? "--model" : "",
@@ -363,8 +439,8 @@ function shellCommand(command) {
 }
 
 function graphUpdateDraftFromOutput(manifest, stdout) {
-  const parsed = extractJSONObject(stdout);
-  if (!parsed || typeof parsed !== "object") {
+  const parsed = graphUpdateDraftCandidate(extractJSONObject(stdout));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("graph_update task did not produce a JSON draft");
   }
   if (!Array.isArray(parsed.task_drafts) || parsed.task_drafts.length === 0) {
@@ -392,8 +468,129 @@ function extractJSONObject(value) {
     if (first === -1 || last <= first) {
       return null;
     }
-    return JSON.parse(trimmed.slice(first, last + 1));
+    try {
+      return JSON.parse(trimmed.slice(first, last + 1));
+    } catch {
+      return null;
+    }
   }
+}
+
+function graphUpdateDraftCandidate(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  if (parsed.structured_output && typeof parsed.structured_output === "object") {
+    return parsed.structured_output;
+  }
+  if (typeof parsed.structured_output === "string") {
+    return graphUpdateDraftCandidate(extractJSONObject(parsed.structured_output));
+  }
+  if (Array.isArray(parsed.task_drafts) || typeof parsed.summary === "string") {
+    return parsed;
+  }
+  if (parsed.result && typeof parsed.result === "object") {
+    return graphUpdateDraftCandidate(parsed.result);
+  }
+  if (typeof parsed.result === "string") {
+    return graphUpdateDraftCandidate(extractJSONObject(parsed.result));
+  }
+  return null;
+}
+
+function recordDebug(lines, env, secrets, label, value) {
+  if (!isDebugMode(env)) {
+    return;
+  }
+  const message = `${label}: ${formatDebugValue(value, secrets)}`;
+  debug(message, env);
+  lines.push(message);
+}
+
+function formatDebugValue(value, secrets) {
+  const formatted = typeof value === "string" ? value : JSON.stringify(redact(value));
+  return sanitizeText(formatted || "", secrets);
+}
+
+function manifestDebugSummary(manifest) {
+  return {
+    agent_task_session_id: manifest.agent_task_session_id,
+    agent_task_id: manifest.agent_task_id,
+    graph_agent_task_id: manifest.graph_agent_task_id,
+    agent_task_purpose: manifest.agent_task_purpose || "",
+    agent_runtime_type: manifest.agent_runtime_type || "",
+    agent_model: manifest.agent_model || "",
+    prompt_bytes: byteLength(manifest.prompt || ""),
+    repository_count: Array.isArray(manifest.repositories) ? manifest.repositories.length : 0,
+    repositories: (manifest.repositories || []).map((repository) => ({
+      repository_id: repository.repository_id || "",
+      git_url: repository.git_url || "",
+      checkout_path: repository.checkout_path || "",
+      selected_ref: repository.selected_ref || "",
+      access_mode: repository.access_mode || "",
+      auto_pull_request_enabled: repository.auto_pull_request_enabled !== false,
+    })),
+    agent_runtime_environment_keys: Object.keys(manifest.agent_runtime_environment || {}).sort(),
+  };
+}
+
+function runtimeResultSummary(result) {
+  return {
+    exit_code: result.status ?? 1,
+    signal: result.signal,
+    stdout_bytes: byteLength(result.stdout || ""),
+    stderr_bytes: byteLength(result.stderr || ""),
+  };
+}
+
+function commandForDebug(command, manifest, secrets) {
+  const prompt = runtimePrompt(manifest);
+  return (command || []).map((part) => {
+    const value = String(part || "");
+    if (value === prompt || value === String(manifest.prompt || "")) {
+      return "[PROMPT_REDACTED]";
+    }
+    if (looksLikeGraphUpdateSchema(value)) {
+      return "[JSON_SCHEMA]";
+    }
+    return sanitizeText(value, secrets);
+  });
+}
+
+function looksLikeGraphUpdateSchema(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && parsed.type === "object" && parsed.properties && parsed.properties.task_drafts;
+  } catch {
+    return false;
+  }
+}
+
+function manifestSecretValues(manifest) {
+  const values = [manifest.prompt];
+  for (const value of Object.values(manifest.agent_runtime_environment || {})) {
+    values.push(value);
+  }
+  for (const repository of manifest.repositories || []) {
+    values.push(repository.token);
+    values.push(repository.access_token);
+    values.push(repository.credential && repository.credential.token);
+  }
+  return [...new Set(values.map((value) => String(value || "")).filter((value) => value.length >= 3))].sort(
+    (left, right) => right.length - left.length,
+  );
+}
+
+function sanitizeText(value, secrets) {
+  let output = String(value || "");
+  for (const secret of secrets || []) {
+    output = output.split(secret).join("[REDACTED]");
+  }
+  return output;
 }
 
 function createPullRequestsForChangedRepositories(manifest) {
@@ -518,9 +715,12 @@ function compact(values) {
   return values.filter(Boolean);
 }
 
-function tail(value) {
-  const max = 12000;
+function tail(value, max = 12000) {
   return value.length > max ? value.slice(value.length - max) : value;
+}
+
+function byteLength(value) {
+  return Buffer.byteLength(String(value || ""), "utf8");
 }
 
 if (require.main === module) {
@@ -536,11 +736,15 @@ module.exports = {
   extractJSONObject,
   graphUpdateDraftSchema,
   graphUpdateDraftFromOutput,
+  graphUpdateDraftCandidate,
+  manifestSecretValues,
   prepareCodexAuthentication,
   prepareOpenCodeAuthentication,
   prepareRuntimeAuthentication,
   runtimeAuthStatus,
   runtimeCommand,
+  runAgent,
+  sanitizeText,
   shouldCreatePullRequest,
   synthesizeOpenCodeConfig,
   validateRuntimeAuth,

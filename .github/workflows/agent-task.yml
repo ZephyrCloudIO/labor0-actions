@@ -40,6 +40,15 @@ jobs:
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
 
+      - name: Upload debug diagnostics
+        if: ${{ always() && steps.run-agent.outputs.debug_artifact_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: labor0-agent-debug-${{ inputs.agent_task_session_id }}
+          path: ${{ steps.run-agent.outputs.debug_artifact_path }}
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Report graph update draft
         if: ${{ success() && steps.run-agent.outputs.graph_update_draft_path != '' }}
         uses: ZephyrCloudIO/labor0-actions/actions/report-event@main
