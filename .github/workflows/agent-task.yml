@@ -30,18 +30,20 @@ jobs:
           graph_agent_base_url: ${{ inputs.graph_agent_base_url }}
 
       - name: Checkout repositories
+        if: ${{ steps.bootstrap.outputs.manifest_path != '' }}
         uses: ZephyrCloudIO/labor0-actions/actions/checkout-repositories@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
 
       - name: Run agent
         id: run-agent
+        if: ${{ steps.bootstrap.outputs.manifest_path != '' }}
         uses: ZephyrCloudIO/labor0-actions/actions/run-agent@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
 
       - name: Report result
-        if: always()
+        if: ${{ always() && steps.bootstrap.outputs.manifest_path != '' }}
         uses: ZephyrCloudIO/labor0-actions/actions/report-event@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
@@ -57,14 +59,14 @@ jobs:
           graph_update_draft_path: ${{ steps.run-agent.outputs.graph_update_draft_path }}
 
       - name: Report completion
-        if: ${{ success() }}
+        if: ${{ success() && steps.bootstrap.outputs.manifest_path != '' }}
         uses: ZephyrCloudIO/labor0-actions/actions/report-event@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}
           event_type: completed
 
       - name: Report failure
-        if: ${{ failure() }}
+        if: ${{ failure() && steps.bootstrap.outputs.manifest_path != '' }}
         uses: ZephyrCloudIO/labor0-actions/actions/report-event@v1
         with:
           manifest_path: ${{ steps.bootstrap.outputs.manifest_path }}

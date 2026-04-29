@@ -7,18 +7,22 @@ const { fail, getInput, info, readJSON, setOutput, writeJSON } = require("../lib
 const { readManifest } = require("../lib/manifest");
 const { redact } = require("../lib/redaction");
 
+const CODEX_PACKAGE = "@openai/codex@0.125.0";
+
 function main() {
   const manifest = readManifest(getInput("manifest_path", { required: true }));
   const resultPath = path.join(process.env.RUNNER_TEMP || process.cwd(), "labor0-agent-task-result.json");
   const graphUpdateDraftPath = graphUpdateDraftOutputPath(manifest);
   const prompt = promptForManifest(manifest, graphUpdateDraftPath);
-  const command = runtimeCommand(manifest, prompt);
+  const agentEnv = runtimeEnvironment(manifest);
+  const command = runtimeCommand(manifest, prompt, agentEnv);
   info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
   const startedAt = new Date();
   const result = spawnSync(command[0], command.slice(1), {
     cwd: process.env.GITHUB_WORKSPACE || process.cwd(),
     env: {
       ...process.env,
+      ...agentEnv,
       LABOR0_AGENT_TASK_SESSION_ID: manifest.agent_task_session_id,
       LABOR0_AGENT_TASK_ID: manifest.agent_task_id,
       LABOR0_GRAPH_AGENT_TASK_ID: manifest.graph_agent_task_id,
@@ -58,13 +62,14 @@ function main() {
   }
 }
 
-function runtimeCommand(manifest, prompt) {
-  if (process.env.LABOR0_AGENT_COMMAND) {
-    return shellCommand(process.env.LABOR0_AGENT_COMMAND, prompt);
+function runtimeCommand(manifest, prompt, agentEnv) {
+  const overrideCommand = process.env.LABOR0_AGENT_COMMAND || agentEnv.LABOR0_AGENT_COMMAND;
+  if (overrideCommand) {
+    return shellCommand(overrideCommand, prompt);
   }
   switch (manifest.agent_runtime_type) {
     case "codex":
-      return ["codex", "exec", "--ask-for-approval", "never", "--sandbox", "danger-full-access", prompt];
+      return codexCommand(prompt);
     case "claude_code":
       return ["claude", "--print", prompt];
     case "opencode":
@@ -74,9 +79,37 @@ function runtimeCommand(manifest, prompt) {
   }
 }
 
+function codexCommand(prompt) {
+  const args = ["--ask-for-approval", "never", "--sandbox", "danger-full-access", "exec", prompt];
+  if (commandExists("codex")) {
+    return ["codex", ...args];
+  }
+  return ["npx", "--yes", CODEX_PACKAGE, ...args];
+}
+
+function commandExists(command) {
+  const result = spawnSync(command, ["--version"], { stdio: "ignore" });
+  return !result.error && result.status === 0;
+}
+
 function shellCommand(command, prompt) {
   void prompt;
   return ["bash", "-lc", command];
+}
+
+function runtimeEnvironment(manifest) {
+  const value = manifest.agent_runtime_environment || {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Manifest agent_runtime_environment must be an object");
+  }
+  const env = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== "string") {
+      throw new Error(`Manifest agent_runtime_environment.${key} must be a string`);
+    }
+    env[key] = item;
+  }
+  return env;
 }
 
 function graphUpdateDraftOutputPath(manifest) {

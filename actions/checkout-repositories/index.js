@@ -35,10 +35,19 @@ function normalizeRef(ref) {
 
 function credentialedGitURL(repository) {
   const token = repository.token || repository.access_token || (repository.credential && repository.credential.token);
-  if (!token || !/^https:\/\/github\.com\//i.test(repository.git_url || "")) {
-    return repository.git_url;
+  const gitURL = githubHTTPSURL(repository.git_url || "");
+  if (!token || !/^https:\/\/github\.com\//i.test(gitURL)) {
+    return gitURL;
   }
-  return repository.git_url.replace(/^https:\/\//i, `https://x-access-token:${encodeURIComponent(token)}@`);
+  return gitURL.replace(/^https:\/\//i, `https://x-access-token:${encodeURIComponent(token)}@`);
+}
+
+function githubHTTPSURL(gitURL) {
+  const sshMatch = gitURL.match(/^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/i);
+  if (sshMatch) {
+    return `https://github.com/${sshMatch[1]}.git`;
+  }
+  return gitURL;
 }
 
 try {

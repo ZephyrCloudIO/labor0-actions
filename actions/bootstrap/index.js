@@ -12,15 +12,20 @@ async function main() {
   const token = await requestOIDCToken(audience);
   addMask(token);
 
-  const response = await fetch(`${baseURL}/github-actions/agent-task-sessions/${sessionID}/bootstrap`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: "{}",
-  });
+  let response;
+  try {
+    response = await fetch(`${baseURL}/github-actions/agent-task-sessions/${sessionID}/bootstrap`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+  } catch (error) {
+    throw new Error(`graph-agent bootstrap URL ${baseURL} is unreachable from GitHub Actions: ${errorMessage(error)}`);
+  }
   if (!response.ok) {
     throw new Error(`graph-agent bootstrap failed with ${response.status}: ${await response.text()}`);
   }
@@ -30,6 +35,10 @@ async function main() {
   writeJSON(manifestPath, manifest);
   setOutput("manifest_path", manifestPath);
   info(`Received graph-agent manifest for session ${sessionID}`);
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 main().catch(fail);

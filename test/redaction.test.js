@@ -7,6 +7,9 @@ const { redact, shouldRedactKey } = require("../actions/lib/redaction");
 test("redacts nested token, secret, credential, and prompt fields", () => {
   const value = {
     prompt: "private task prompt",
+    agent_runtime_environment: {
+      OPENAI_API_KEY: "api-key",
+    },
     nested: {
       accessToken: "token",
       regular: "visible",
@@ -17,6 +20,9 @@ test("redacts nested token, secret, credential, and prompt fields", () => {
   };
   assert.deepEqual(redact(value), {
     prompt: "[REDACTED]",
+    agent_runtime_environment: {
+      OPENAI_API_KEY: "[REDACTED]",
+    },
     nested: {
       accessToken: "[REDACTED]",
       regular: "visible",
@@ -28,6 +34,7 @@ test("redacts nested token, secret, credential, and prompt fields", () => {
 test("detects common secret key spellings", () => {
   assert.equal(shouldRedactKey("access_token"), true);
   assert.equal(shouldRedactKey("accessToken"), true);
+  assert.equal(shouldRedactKey("OPENAI_API_KEY"), true);
   assert.equal(shouldRedactKey("provider_secret"), true);
   assert.equal(shouldRedactKey("summary"), false);
 });

@@ -25,6 +25,20 @@ test("reusable workflow only accepts session bootstrap inputs", () => {
   const workflow = fs.readFileSync(path.join(root, ".github/workflows/agent-task.yml"), "utf8");
   assert.match(workflow, /agent_task_session_id:/);
   assert.match(workflow, /graph_agent_base_url:/);
+  assert.match(workflow, /steps\.bootstrap\.outputs\.manifest_path != ''/);
+  assert.match(workflow, /graph_update_draft_path:/);
+  assert.doesNotMatch(workflow, /prompt:/);
+  assert.doesNotMatch(workflow, /provider_secret:/);
+  assert.doesNotMatch(workflow, /repo_token:/);
+  assert.match(workflow, /id-token:\s+write/);
+});
+
+test("dispatch wrapper exists for graph-agent workflow dispatch tests", () => {
+  const workflow = fs.readFileSync(path.join(root, ".github/workflows/labor0.yml"), "utf8");
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /agent_task_session_id:/);
+  assert.match(workflow, /graph_agent_base_url:/);
+  assert.match(workflow, /ZephyrCloudIO\/labor0-actions\/\.github\/workflows\/agent-task\.yml@v1/);
   assert.doesNotMatch(workflow, /prompt:/);
   assert.doesNotMatch(workflow, /provider_secret:/);
   assert.doesNotMatch(workflow, /repo_token:/);

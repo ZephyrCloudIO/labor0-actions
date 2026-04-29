@@ -1,19 +1,14 @@
-# labor0-actions
-
-Shared GitHub Actions runner infrastructure for Labor0 graph-agent tasks.
-
-Target repositories expose the dispatchable wrapper at `.github/workflows/labor0.yml`:
-
-```yaml
 name: Labor0 Agent Task
 
 on:
   workflow_dispatch:
     inputs:
       agent_task_session_id:
+        description: Graph-agent task session id.
         required: true
         type: string
       graph_agent_base_url:
+        description: Public graph-agent base URL.
         required: true
         type: string
 
@@ -28,6 +23,3 @@ jobs:
     with:
       agent_task_session_id: ${{ inputs.agent_task_session_id }}
       graph_agent_base_url: ${{ inputs.graph_agent_base_url }}
-```
-
-Prompts, repository credentials, and provider credentials must not be passed as workflow inputs. The workflow bootstraps with GitHub Actions OIDC and receives the execution manifest from graph-agent.
