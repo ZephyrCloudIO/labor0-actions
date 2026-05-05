@@ -7,6 +7,7 @@ const path = require("node:path");
 const test = require("node:test");
 const { isDebugMode } = require("../actions/lib/core");
 const {
+  createPullRequestsForChangedRepositories,
   graphUpdateDraftFromOutput,
   graphUpdateDraftSchema,
   prepareClaudeCodeAuthentication,
@@ -16,6 +17,7 @@ const {
   runtimeCommand,
   runAgent,
   shouldCreatePullRequest,
+  shouldUpdateExistingPullRequest,
   synthesizeOpenCodeConfig,
   validateRuntimeAuth,
 } = require("../actions/run-agent/index");
@@ -723,7 +725,121 @@ test("pull request creation defaults on for read-write repositories only", () =>
     false,
   );
   assert.equal(shouldCreatePullRequest({ access_mode: "read_only" }), false);
+  assert.equal(
+    shouldCreatePullRequest({
+      access_mode: "read_write",
+      pull_request_update: { branch_name: "feature/review-fix" },
+    }),
+    false,
+  );
+  assert.equal(
+    shouldUpdateExistingPullRequest({
+      access_mode: "read_write",
+      auto_pull_request_enabled: false,
+      pull_request_update: { branch_name: "feature/review-fix" },
+    }),
+    true,
+  );
 });
+
+test("existing pull request update pushes target branch without reporting a new pull request", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-existing-pr-test-"));
+  const checkoutPath = path.join(tempDir, "repo");
+  const binPath = path.join(tempDir, "bin");
+  const logPath = path.join(tempDir, "commands.jsonl");
+  fs.mkdirSync(checkoutPath, { recursive: true });
+  fs.mkdirSync(binPath, { recursive: true });
+  writeExecutable(
+    path.join(binPath, "git"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LABOR0_TEST_COMMAND_LOG, JSON.stringify({ command: "git", args }) + "\\n");
+if (args[0] === "status") {
+  process.stdout.write(" M file.js\\n");
+}
+process.exit(0);
+`,
+  );
+  writeExecutable(
+    path.join(binPath, "gh"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(process.env.LABOR0_TEST_COMMAND_LOG, JSON.stringify({ command: "gh", args: process.argv.slice(2) }) + "\\n");
+process.exit(1);
+`,
+  );
+
+  withEnv(
+    {
+      GITHUB_WORKSPACE: tempDir,
+      LABOR0_TEST_COMMAND_LOG: logPath,
+      PATH: `${binPath}${path.delimiter}${process.env.PATH || ""}`,
+    },
+    () => {
+      const pullRequests = createPullRequestsForChangedRepositories({
+        agent_task_session_id: "0199e7be-9000-7000-8000-000000000001",
+        agent_task_id: "0199e7be-9000-7000-8000-000000000010",
+        agent_runtime_type: "codex",
+        task_title: "review feedback",
+        repositories: [
+          {
+            repository_id: "0199e7be-9000-7000-8000-000000000003",
+            git_url: "https://github.com/example/repo.git",
+            checkout_path: "repo",
+            selected_ref: "refs/heads/feature/review-fix",
+            access_mode: "read_write",
+            auto_pull_request_enabled: false,
+            pull_request_update: {
+              pull_request_ref: "github:example/repo#12",
+              pull_request_number: 12,
+              pull_request_url: "https://github.com/example/repo/pull/12",
+              branch_name: "feature/review-fix",
+            },
+          },
+        ],
+      });
+
+      assert.deepEqual(pullRequests, []);
+    },
+  );
+
+  const commands = fs
+    .readFileSync(logPath, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(commands.map((command) => command.command), ["git", "git", "git", "git", "git", "git"]);
+  assert.deepEqual(commands.at(-1), {
+    command: "git",
+    args: ["push", "origin", "HEAD:feature/review-fix"],
+  });
+  assert.equal(commands.some((command) => command.command === "gh"), false);
+});
+
+function writeExecutable(filePath, content) {
+  fs.writeFileSync(filePath, content);
+  fs.chmodSync(filePath, 0o755);
+}
+
+function withEnv(values, callback) {
+  const previous = {};
+  for (const key of Object.keys(values)) {
+    previous[key] = process.env[key];
+    process.env[key] = values[key];
+  }
+  try {
+    return callback();
+  } finally {
+    for (const key of Object.keys(values)) {
+      if (previous[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previous[key];
+      }
+    }
+  }
+}
 
 function graphUpdateDraftJSON(overrides = {}) {
   return {

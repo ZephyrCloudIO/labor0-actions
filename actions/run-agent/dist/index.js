@@ -1078,6 +1078,7 @@ function manifestDebugSummary(manifest) {
       selected_ref: repository.selected_ref || "",
       access_mode: repository.access_mode || "",
       auto_pull_request_enabled: repository.auto_pull_request_enabled !== false,
+      pull_request_update: pullRequestUpdateDebugSummary(repository.pull_request_update),
     })),
     agent_runtime_environment_keys: Object.keys(manifest.agent_runtime_environment || {}).sort(),
   };
@@ -1182,7 +1183,7 @@ function sanitizeText(value, secrets) {
 function createPullRequestsForChangedRepositories(manifest) {
   const pullRequests = [];
   for (const repository of manifest.repositories || []) {
-    if (!shouldCreatePullRequest(repository)) {
+    if (!shouldPublishRepositoryChanges(repository)) {
       continue;
     }
     const checkoutPath = path.resolve(
@@ -1192,13 +1193,29 @@ function createPullRequestsForChangedRepositories(manifest) {
     if (!fs.existsSync(checkoutPath) || !hasChanges(checkoutPath)) {
       continue;
     }
+    if (shouldUpdateExistingPullRequest(repository)) {
+      pushExistingPullRequestUpdate(manifest, repository, checkoutPath);
+      continue;
+    }
     pullRequests.push(createPullRequest(manifest, repository, checkoutPath));
   }
   return pullRequests;
 }
 
+function shouldPublishRepositoryChanges(repository) {
+  return shouldUpdateExistingPullRequest(repository) || shouldCreatePullRequest(repository);
+}
+
+function shouldUpdateExistingPullRequest(repository) {
+  return repository.access_mode === "read_write" && Boolean(existingPullRequestUpdate(repository));
+}
+
 function shouldCreatePullRequest(repository) {
-  return repository.access_mode === "read_write" && repository.auto_pull_request_enabled !== false;
+  return (
+    repository.access_mode === "read_write" &&
+    !existingPullRequestUpdate(repository) &&
+    repository.auto_pull_request_enabled !== false
+  );
 }
 
 function hasChanges(cwd) {
@@ -1239,6 +1256,41 @@ function createPullRequest(manifest, repository, cwd) {
     pull_request_number: pr.number,
     pull_request_url: pr.url,
     is_open: true,
+  };
+}
+
+function pushExistingPullRequestUpdate(manifest, repository, cwd) {
+  const update = existingPullRequestUpdate(repository);
+  const branchName = normalizeRef(update.branch_name || update.branch || repository.selected_ref);
+  if (!branchName) {
+    throw new Error(`Cannot update existing pull request for repository ${repository.repository_id}: missing branch_name`);
+  }
+  const title = `chore: apply ${manifest.task_title || "Labor0 agent task"}`;
+  run("git", ["config", "user.name", "labor0-agent"], { cwd });
+  run("git", ["config", "user.email", "agent@labor0.com"], { cwd });
+  run("git", ["add", "-A"], { cwd });
+  run("git", ["commit", "-m", title], { cwd });
+  run("git", ["push", "origin", `HEAD:${branchName}`], { cwd });
+  info(`Pushed changes to existing pull request ${update.pull_request_ref || branchName}`);
+}
+
+function existingPullRequestUpdate(repository) {
+  const update = repository && repository.pull_request_update;
+  if (!update || typeof update !== "object" || Array.isArray(update)) {
+    return null;
+  }
+  return update;
+}
+
+function pullRequestUpdateDebugSummary(update) {
+  if (!update || typeof update !== "object" || Array.isArray(update)) {
+    return undefined;
+  }
+  return {
+    pull_request_ref: update.pull_request_ref || "",
+    pull_request_number: update.pull_request_number || null,
+    pull_request_url: update.pull_request_url || "",
+    branch_name: update.branch_name || update.branch || "",
   };
 }
 
@@ -1319,6 +1371,7 @@ if (require.main === require.cache[eval('__filename')]) {
 
 module.exports = {
   agentEnvironment,
+  createPullRequestsForChangedRepositories,
   extractJSONObject,
   graphUpdateDraftSchema,
   graphUpdateDraftFromOutput,
@@ -1333,6 +1386,7 @@ module.exports = {
   runAgent,
   sanitizeText,
   shouldCreatePullRequest,
+  shouldUpdateExistingPullRequest,
   synthesizeOpenCodeConfig,
   validateRuntimeAuth,
 };
