@@ -10,11 +10,16 @@ const {
   createPullRequestsForChangedRepositories,
   graphUpdateDraftFromOutput,
   graphUpdateDraftSchema,
+  isPlanModeEnabled,
+  manifestWithApprovedPlan,
+  planGenerationPrompt,
+  planTextFromOutput,
   prepareClaudeCodeAuthentication,
   prepareCodexAuthentication,
   prepareOpenCodeAuthentication,
   runtimeAuthStatus,
   runtimeCommand,
+  runPlanApprovalLoop,
   runAgent,
   shouldCreatePullRequest,
   shouldUpdateExistingPullRequest,
@@ -92,6 +97,67 @@ test("opencode command passes model and permission bypass", () => {
     "openai/gpt-5.4",
     "Implement runtime auth",
   ]);
+});
+
+test("plan commands use provider read-only planning modes where available", () => {
+  assert.deepEqual(
+    runtimeCommand(
+      {
+        agent_runtime_type: "codex",
+        agent_task_purpose: "coding",
+        agent_model: "gpt-5.4",
+        prompt: "Plan safely",
+      },
+      { phase: "plan" },
+    ).slice(0, 7),
+    ["codex", "exec", "--ask-for-approval", "never", "--sandbox", "read-only", "--skip-git-repo-check"],
+  );
+  assert.deepEqual(
+    runtimeCommand(
+      {
+        agent_runtime_type: "claude_code",
+        agent_task_purpose: "coding",
+        agent_model: "claude-sonnet-4-6",
+        prompt: "Plan safely",
+      },
+      { phase: "plan" },
+    ).slice(0, 4),
+    ["claude", "-p", "--permission-mode", "plan"],
+  );
+  assert.deepEqual(
+    runtimeCommand(
+      {
+        agent_runtime_type: "opencode",
+        agent_task_purpose: "coding",
+        agent_model: "openai/gpt-5.4",
+        prompt: "Plan safely",
+      },
+      { phase: "plan" },
+    ),
+    ["opencode", "run", "--model", "openai/gpt-5.4", "Plan safely"],
+  );
+});
+
+test("plan prompt and approved plan manifest keep implementation gated", () => {
+  const manifest = codingPlanManifest();
+  assert.equal(isPlanModeEnabled(manifest), true);
+  assert.equal(isPlanModeEnabled({ ...manifest, agent_task_purpose: "graph_update" }), false);
+  const prompt = planGenerationPrompt(manifest, {
+    revision: 2,
+    revisionLimit: 3,
+    revisionNotes: "Use the smaller API surface.",
+  });
+  assert.match(prompt, /Do not edit files/);
+  assert.match(prompt, /revision 2/);
+  assert.match(prompt, /Use the smaller API surface/);
+
+  const approved = manifestWithApprovedPlan(manifest, {
+    planRevision: 2,
+    planText: "1. Update the route.\n2. Add tests.",
+  });
+  assert.match(approved.prompt, /Approved implementation plan, revision 2/);
+  assert.equal(approved.plan_mode.approved_plan_revision, 2);
+  assert.equal(approved.plan_mode.approved_plan_text, "1. Update the route.\n2. Add tests.");
 });
 
 test("runtime auth validation reports missing provider credentials", () => {
@@ -539,14 +605,13 @@ test("graph update draft extraction accepts Claude Code structured output envelo
   assert.equal(draft.task_drafts[0].draft_task_key, "implement-runtime");
 });
 
-test("graph update parse failure writes result output before failing", () => {
+test("graph update parse failure writes result output before failing", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-run-agent-test-"));
   const outputs = {};
   const manifest = graphUpdateManifest();
 
-  assert.throws(
-    () =>
-      runAgent(manifest, {
+  await assert.rejects(
+    runAgent(manifest, {
         tempDir,
         cwd: tempDir,
         env: { ANTHROPIC_API_KEY: "sk-ant-test", RUNNER_TEMP: tempDir },
@@ -573,14 +638,13 @@ test("graph update parse failure writes result output before failing", () => {
   assert.match(result.stderr_tail, /no structured output/);
 });
 
-test("graph update validation failure writes result output before failing", () => {
+test("graph update validation failure writes result output before failing", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-run-agent-validation-test-"));
   const outputs = {};
   const manifest = graphUpdateManifest();
 
-  assert.throws(
-    () =>
-      runAgent(manifest, {
+  await assert.rejects(
+    runAgent(manifest, {
         tempDir,
         cwd: tempDir,
         env: { ANTHROPIC_API_KEY: "sk-ant-test", RUNNER_TEMP: tempDir },
@@ -628,7 +692,151 @@ test("graph update draft schema requires nested edge refs", () => {
   assert.equal(schema.properties.remove_edges.items.properties.successor.properties.draft_task_key, undefined);
 });
 
-test("debug diagnostics redact prompt, runtime secrets, and repository tokens", () => {
+test("plan output extraction accepts provider text and JSON envelopes", () => {
+  assert.equal(planTextFromOutput("  ## Plan\n- Change the route\n"), "## Plan\n- Change the route");
+  assert.equal(
+    planTextFromOutput(JSON.stringify({ type: "result", result: "## Plan\n- Add tests" })),
+    "## Plan\n- Add tests",
+  );
+  assert.equal(
+    planTextFromOutput(JSON.stringify({ structured_output: { plan_text: "## Plan\n- Wire callback" } })),
+    "## Plan\n- Wire callback",
+  );
+  assert.throws(() => planTextFromOutput(""), /plan generation did not produce plan text/);
+});
+
+test("plan approval loop posts revisions and returns the approved plan", async () => {
+  const manifest = codingPlanManifest();
+  const posted = [];
+  const waited = [];
+  const spawnedPrompts = [];
+  await withFetch(async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (String(url).endsWith("/events")) {
+      posted.push(body.plan_proposal);
+      return jsonResponse({ ok: true });
+    }
+    waited.push(body);
+    return jsonResponse(
+      waited.length === 1
+        ? {
+            decision: "revision_requested",
+            revision_notes: "Cover the route test.",
+            plan_revision: 1,
+          }
+        : {
+            decision: "approved",
+            plan_revision: 2,
+            plan_text: "## Approved plan\n- Cover the route test.",
+          },
+    );
+  }, async () => {
+    const approval = await runPlanApprovalLoop(manifest, {
+      env: { OPENAI_API_KEY: "sk-test" },
+      baseEnv: { OPENAI_API_KEY: "sk-test" },
+      requestOIDCToken: async (audience) => {
+        assert.equal(audience, "https://graph.example");
+        return "oidc-token";
+      },
+      installRuntime: () => {},
+      prepareRuntimeAuthentication: () => {},
+      spawnSync: (_command, args) => {
+        spawnedPrompts.push(args.at(-1));
+        return {
+          status: 0,
+          signal: null,
+          stdout: `## Plan ${spawnedPrompts.length}\n- Step`,
+          stderr: "",
+        };
+      },
+    });
+    assert.deepEqual(approval, {
+      planRevision: 2,
+      planText: "## Approved plan\n- Cover the route test.",
+    });
+    assert.deepEqual(posted.map((item) => item.plan_revision), [1, 2]);
+    assert.deepEqual(waited, [{ plan_revision: 1 }, { plan_revision: 2 }]);
+    assert.match(spawnedPrompts[1], /Cover the route test/);
+  });
+});
+
+test("plan approval loop stops on rejection without implementation", async () => {
+  const manifest = codingPlanManifest();
+  await withFetch(async (url, init) => {
+    if (String(url).endsWith("/events")) {
+      return jsonResponse({ ok: true });
+    }
+    assert.deepEqual(JSON.parse(init.body), { plan_revision: 1 });
+    return jsonResponse({
+      decision: "rejected",
+      revision_notes: "Wrong direction.",
+      plan_revision: 1,
+    });
+  }, async () => {
+    await assert.rejects(
+      runPlanApprovalLoop(manifest, {
+        env: { OPENAI_API_KEY: "sk-test" },
+        baseEnv: { OPENAI_API_KEY: "sk-test" },
+        requestOIDCToken: async () => "oidc-token",
+        spawnSync: () => ({
+          status: 0,
+          signal: null,
+          stdout: "## Plan\n- Step",
+          stderr: "",
+        }),
+      }),
+      /plan decision was rejected/,
+    );
+  });
+});
+
+test("run agent implements only after plan approval", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-plan-run-agent-test-"));
+  const outputs = {};
+  const prompts = [];
+  await withFetch(async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (String(url).endsWith("/events")) {
+      assert.equal(body.event_type, "plan_proposed");
+      assert.equal(body.plan_proposal.plan_revision, 1);
+      return jsonResponse({ ok: true });
+    }
+    return jsonResponse({
+      decision: "approved",
+      plan_revision: 1,
+      plan_text: "## Approved plan\n- Implement after approval.",
+    });
+  }, async () => {
+    const result = await runAgent(codingPlanManifest(), {
+      tempDir,
+      cwd: tempDir,
+      env: { OPENAI_API_KEY: "sk-test", RUNNER_TEMP: tempDir },
+      installRuntime: () => {},
+      prepareRuntimeAuthentication: () => {},
+      requestOIDCToken: async () => "oidc-token",
+      setOutput: (name, value) => {
+        outputs[name] = value;
+      },
+      spawnSync: (_command, args) => {
+        prompts.push(args.at(-1));
+        return {
+          status: 0,
+          signal: null,
+          stdout: prompts.length === 1 ? "## Plan\n- Implement after approval." : "done",
+          stderr: "",
+        };
+      },
+    });
+    assert.equal(result.output.plan_mode_enabled, true);
+    assert.equal(result.output.plan_decision, "approved");
+    assert.equal(result.output.approved_plan_revision, 1);
+    assert.match(prompts[0], /Do not edit files/);
+    assert.match(prompts[1], /Approved implementation plan, revision 1/);
+    assert.equal(outputs.result_path, path.join(tempDir, "labor0-agent-task-result.json"));
+  });
+});
+
+test("debug diagnostics redact prompt, runtime secrets, and repository tokens", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-run-agent-debug-test-"));
   const outputs = {};
   const manifest = graphUpdateManifest({
@@ -671,7 +879,7 @@ test("debug diagnostics redact prompt, runtime secrets, and repository tokens", 
     "ghs-private-token",
   ].join("\n");
 
-  runAgent(manifest, {
+  await runAgent(manifest, {
     tempDir,
     cwd: tempDir,
     env: { LABOR0_AGENT_DEBUG: "true", RUNNER_TEMP: tempDir },
@@ -839,6 +1047,49 @@ function withEnv(values, callback) {
       }
     }
   }
+}
+
+async function withFetch(fetcher, callback) {
+  const previous = globalThis.fetch;
+  globalThis.fetch = fetcher;
+  try {
+    return await callback();
+  } finally {
+    globalThis.fetch = previous;
+  }
+}
+
+function jsonResponse(value, init = {}) {
+  return new Response(JSON.stringify(value), {
+    status: init.status || 200,
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+function codingPlanManifest(overrides = {}) {
+  return {
+    agent_task_session_id: "0199e7be-9000-7000-8000-000000000001",
+    agent_task_id: "0199e7be-9000-7000-8000-000000000010",
+    graph_agent_task_id: "0199e7be-9000-7000-8000-000000000020",
+    agent_task_purpose: "coding",
+    agent_runtime_type: "codex",
+    agent_model: "gpt-5.4",
+    prompt: "Implement plan mode.",
+    callback_url: "https://graph.example/github-actions/agent-task-sessions/0199e7be-9000-7000-8000-000000000001/events",
+    plan_mode: {
+      enabled: true,
+      approval_target_user_group_id: "0199e7be-9000-7000-8000-000000000030",
+      mobile_tty_session_id: "0199e7be-9000-7000-8000-000000000040",
+      revision_limit: 3,
+      plan_callback_url: "https://graph.example/github-actions/agent-task-sessions/0199e7be-9000-7000-8000-000000000001/events",
+      plan_decision_url:
+        "https://graph.example/github-actions/agent-task-sessions/0199e7be-9000-7000-8000-000000000001/plan-decision",
+    },
+    repositories: [],
+    ...overrides,
+  };
 }
 
 function graphUpdateDraftJSON(overrides = {}) {

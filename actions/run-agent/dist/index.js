@@ -98,6 +98,42 @@ module.exports = {
 
 /***/ }),
 
+/***/ 7452:
+/***/ ((module) => {
+
+
+
+async function requestOIDCToken(audience) {
+  const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  const requestURL = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  if (!requestToken || !requestURL) {
+    throw new Error("GitHub Actions OIDC environment is unavailable; set permissions.id-token to write");
+  }
+  const url = new URL(requestURL);
+  if (audience) {
+    url.searchParams.set("audience", audience);
+  }
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${requestToken}`,
+      Accept: "application/json",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub OIDC token request failed with ${response.status}`);
+  }
+  const body = await response.json();
+  if (!body.value) {
+    throw new Error("GitHub OIDC response did not include a token value");
+  }
+  return body.value;
+}
+
+module.exports = { requestOIDCToken };
+
+
+/***/ }),
+
 /***/ 854:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -208,16 +244,17 @@ const fs = __nccwpck_require__(3024);
 const { spawnSync } = __nccwpck_require__(1421);
 const path = __nccwpck_require__(6760);
 const YAML = __nccwpck_require__(7538);
-const { debug, fail, getInput, info, isDebugMode, setOutput, writeJSON } = __nccwpck_require__(5940);
+const { addMask, debug, fail, getInput, info, isDebugMode, setOutput, writeJSON } = __nccwpck_require__(5940);
+const { requestOIDCToken } = __nccwpck_require__(7452);
 const { readManifest } = __nccwpck_require__(854);
 const { redact } = __nccwpck_require__(8118);
 
-function main() {
+async function main() {
   const manifest = readManifest(getInput("manifest_path", { required: true }));
-  runAgent(manifest);
+  await runAgent(manifest);
 }
 
-function runAgent(manifest, options = {}) {
+async function runAgent(manifest, options = {}) {
   const baseEnv = options.env || process.env;
   const tempDir = options.tempDir || baseEnv.RUNNER_TEMP || process.cwd();
   const resultPath = path.join(tempDir, "labor0-agent-task-result.json");
@@ -226,15 +263,19 @@ function runAgent(manifest, options = {}) {
   const pullRequestsPath = path.join(tempDir, "labor0-agent-task-pull-requests.json");
   const emitOutput = options.setOutput || setOutput;
   const debugEnabled = isDebugMode(baseEnv);
-  const secrets = manifestSecretValues(manifest);
+  let secrets = manifestSecretValues(manifest);
   const debugLines = [];
 
+  let executionManifest = manifest;
   let command = [];
   let graphUpdateDraft = null;
   let pullRequests = [];
   let result = { status: 1, signal: null, stdout: "", stderr: "" };
   let draftParseError = "";
   let runError = null;
+  let planDecision = "";
+  let approvedPlanRevision = 0;
+  let planRevisionCount = 0;
   const startedAt = new Date();
 
   try {
@@ -245,11 +286,35 @@ function runAgent(manifest, options = {}) {
     runtimeValidator(manifest, env);
     runtimeInstaller(manifest.agent_runtime_type);
     runtimeAuthPreparer(manifest, env, { tempDir });
-    command = runtimeCommand(manifest, { env: baseEnv });
     const cwd = options.cwd || baseEnv.GITHUB_WORKSPACE || process.cwd();
     recordDebug(debugLines, baseEnv, secrets, "manifest", manifestDebugSummary(manifest));
-    recordDebug(debugLines, baseEnv, secrets, "runtime command", commandForDebug(command, manifest, secrets));
-    info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
+
+    if (isPlanModeEnabled(manifest)) {
+      const approval = await runPlanApprovalLoop(manifest, {
+        ...options,
+        baseEnv,
+        cwd,
+        env,
+        debugLines,
+        secrets,
+      });
+      planDecision = "approved";
+      approvedPlanRevision = approval.planRevision;
+      planRevisionCount = approval.planRevision;
+      executionManifest = manifestWithApprovedPlan(manifest, approval);
+      env.LABOR0_AGENT_PROMPT = executionManifest.prompt || "";
+      env.LABOR0_APPROVED_PLAN = approval.planText;
+      env.LABOR0_APPROVED_PLAN_REVISION = String(approval.planRevision);
+      secrets = manifestSecretValues(executionManifest);
+      recordDebug(debugLines, baseEnv, secrets, "approved plan", {
+        plan_revision: approvedPlanRevision,
+        plan_bytes: byteLength(approval.planText),
+      });
+    }
+
+    command = runtimeCommand(executionManifest, { env: baseEnv });
+    recordDebug(debugLines, baseEnv, secrets, "runtime command", commandForDebug(command, executionManifest, secrets));
+    info(`Running ${executionManifest.agent_runtime_type || "agent"} for ${executionManifest.agent_task_purpose || "task"}`);
     const spawner = options.spawnSync || spawnSync;
     result = spawner(command[0], command.slice(1), {
       cwd,
@@ -263,9 +328,9 @@ function runAgent(manifest, options = {}) {
       stderr_tail: sanitizeText(tail(result.stderr || "", 4000), secrets),
     });
 
-    if (manifest.agent_task_purpose === "graph_update" && result.status === 0) {
+    if (executionManifest.agent_task_purpose === "graph_update" && result.status === 0) {
       try {
-        graphUpdateDraft = graphUpdateDraftFromOutput(manifest, result.stdout || "");
+        graphUpdateDraft = graphUpdateDraftFromOutput(executionManifest, result.stdout || "");
         writeJSON(graphUpdateDraftPath, graphUpdateDraft);
         emitOutput("graph_update_draft_path", graphUpdateDraftPath);
       } catch (error) {
@@ -275,9 +340,9 @@ function runAgent(manifest, options = {}) {
       }
     }
 
-    if (!runError && result.status === 0 && manifest.agent_task_purpose === "coding") {
+    if (!runError && result.status === 0 && executionManifest.agent_task_purpose === "coding") {
       const pullRequestCreator = options.createPullRequestsForChangedRepositories || createPullRequestsForChangedRepositories;
-      pullRequests = pullRequestCreator(manifest);
+      pullRequests = pullRequestCreator(executionManifest);
       if (pullRequests.length > 0) {
         writeJSON(pullRequestsPath, pullRequests);
         emitOutput("pull_requests_path", pullRequestsPath);
@@ -303,6 +368,10 @@ function runAgent(manifest, options = {}) {
     agent_runtime_type: manifest.agent_runtime_type,
     agent_model: manifest.agent_model || "",
     debug_enabled: debugEnabled,
+    plan_mode_enabled: isPlanModeEnabled(manifest),
+    plan_decision: planDecision || undefined,
+    plan_revision_count: planRevisionCount || undefined,
+    approved_plan_revision: approvedPlanRevision || undefined,
     graph_update_draft_created: Boolean(graphUpdateDraft),
     pull_request_count: pullRequests.length,
     exit_code: result.status ?? 1,
@@ -392,11 +461,29 @@ function commandExists(binary) {
 function runtimeCommand(manifest, options = {}) {
   const prompt = runtimePrompt(manifest);
   const env = options.env || process.env;
-  if (env.LABOR0_AGENT_COMMAND) {
+  const phase = options.phase || "implementation";
+  if (phase === "plan" && env.LABOR0_AGENT_PLAN_COMMAND) {
+    return shellCommand(env.LABOR0_AGENT_PLAN_COMMAND);
+  }
+  if (phase !== "plan" && env.LABOR0_AGENT_COMMAND) {
     return shellCommand(env.LABOR0_AGENT_COMMAND);
   }
   switch (manifest.agent_runtime_type) {
     case "codex":
+      if (phase === "plan") {
+        return compact([
+          "codex",
+          "exec",
+          "--ask-for-approval",
+          "never",
+          "--sandbox",
+          "read-only",
+          "--skip-git-repo-check",
+          manifest.agent_model ? "--model" : "",
+          manifest.agent_model || "",
+          prompt,
+        ]);
+      }
       return compact([
         "codex",
         "exec",
@@ -409,6 +496,17 @@ function runtimeCommand(manifest, options = {}) {
         prompt,
       ]);
     case "claude_code":
+      if (phase === "plan") {
+        return compact([
+          "claude",
+          "-p",
+          "--permission-mode",
+          "plan",
+          manifest.agent_model ? "--model" : "",
+          manifest.agent_model || "",
+          prompt,
+        ]);
+      }
       return compact([
         "claude",
         "-p",
@@ -419,6 +517,15 @@ function runtimeCommand(manifest, options = {}) {
         prompt,
       ]);
     case "opencode":
+      if (phase === "plan") {
+        return compact([
+          "opencode",
+          "run",
+          manifest.agent_model ? "--model" : "",
+          manifest.agent_model || "",
+          prompt,
+        ]);
+      }
       return compact([
         "opencode",
         "run",
@@ -869,6 +976,232 @@ Do not use predecessor_task_id or successor_task_id in draft payloads; those nam
 Do not wrap the YAML in Markdown.`;
 }
 
+async function runPlanApprovalLoop(manifest, options = {}) {
+  const planMode = planModeConfig(manifest);
+  if (!planMode) {
+    throw new Error("Plan mode is not enabled for this manifest");
+  }
+  validatePlanModeConfig(planMode);
+  const baseEnv = options.baseEnv || options.env || process.env;
+  const env = options.env || agentEnvironment(manifest, baseEnv);
+  const cwd = options.cwd || baseEnv.GITHUB_WORKSPACE || process.cwd();
+  const spawner = options.spawnSync || spawnSync;
+  const token = await planModeOIDCToken(manifest, options);
+  const revisionLimit = normalizePlanRevisionLimit(planMode.revision_limit);
+  let revisionNotes = "";
+  for (let revision = 1; revision <= revisionLimit; revision += 1) {
+    const planManifest = {
+      ...manifest,
+      prompt: planGenerationPrompt(manifest, {
+        revision,
+        revisionLimit,
+        revisionNotes,
+      }),
+    };
+    const command = runtimeCommand(planManifest, { env: baseEnv, phase: "plan" });
+    recordDebug(options.debugLines || [], baseEnv, options.secrets || manifestSecretValues(manifest), "plan runtime command", commandForDebug(command, planManifest, options.secrets || manifestSecretValues(manifest)));
+    info(`Generating plan revision ${revision} with ${manifest.agent_runtime_type || "agent"}`);
+    const result = spawner(command[0], command.slice(1), {
+      cwd,
+      env,
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    recordDebug(options.debugLines || [], baseEnv, options.secrets || manifestSecretValues(manifest), "plan runtime result", runtimeResultSummary(result));
+    if (result.status !== 0) {
+      throw new Error(`plan generation exited with ${result.status ?? result.signal}`);
+    }
+    const planText = planTextFromOutput(result.stdout || "");
+    await postPlanProposal(manifest, token, {
+      plan_revision: revision,
+      plan_text: planText,
+    });
+    info(`Waiting for plan revision ${revision} decision`);
+    const decision = await waitForPlanDecision(manifest, token, {
+      plan_revision: revision,
+    });
+    if (decision.decision === "approved") {
+      return {
+        planRevision: Number(decision.plan_revision || revision),
+        planText: String(decision.plan_text || planText),
+      };
+    }
+    if (decision.decision === "revision_requested") {
+      revisionNotes = String(decision.revision_notes || "").trim();
+      if (!revisionNotes) {
+        throw new Error(`plan revision ${revision} requested changes without revision notes`);
+      }
+      info(`Plan revision ${revision} needs changes; generating another revision`);
+      continue;
+    }
+    throw new Error(`plan decision was ${decision.decision || "unknown"}`);
+  }
+  throw new Error(`plan revision limit ${revisionLimit} was exceeded before approval`);
+}
+
+function isPlanModeEnabled(manifest) {
+  return manifest.agent_task_purpose === "coding" && Boolean(planModeConfig(manifest));
+}
+
+function planModeConfig(manifest) {
+  const planMode = manifest && manifest.plan_mode;
+  if (!planMode || typeof planMode !== "object" || Array.isArray(planMode)) {
+    return null;
+  }
+  return planMode.enabled === true ? planMode : null;
+}
+
+function validatePlanModeConfig(planMode) {
+  if (!String(planMode.approval_target_user_group_id || "").trim()) {
+    throw new Error("Plan mode is missing approval_target_user_group_id");
+  }
+  if (!String(planMode.mobile_tty_session_id || "").trim()) {
+    throw new Error("Plan mode is missing mobile_tty_session_id");
+  }
+  if (!String(planMode.plan_callback_url || "").trim()) {
+    throw new Error("Plan mode is missing plan_callback_url");
+  }
+  if (!String(planMode.plan_decision_url || "").trim()) {
+    throw new Error("Plan mode is missing plan_decision_url");
+  }
+  normalizePlanRevisionLimit(planMode.revision_limit);
+}
+
+function normalizePlanRevisionLimit(value) {
+  const parsed = Number(value || 3);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error("Plan mode revision_limit must be a positive integer");
+  }
+  return parsed;
+}
+
+function planGenerationPrompt(manifest, { revision, revisionLimit, revisionNotes }) {
+  const notes = String(revisionNotes || "").trim()
+    ? `\n\nThe previous plan needs revision. Address these operator notes before proposing revision ${revision}:\n${revisionNotes}`
+    : "";
+  return `${manifest.prompt || ""}
+
+You are running Labor0 plan mode for a coding session. Produce an implementation plan only.
+Do not edit files, create commits, push branches, open pull requests, install dependencies, or perform the implementation.
+You may inspect the repository and summarize the exact changes you intend to make after approval.
+
+Plan revision ${revision} of ${revisionLimit}.${notes}
+
+Return only the proposed implementation plan as Markdown.`;
+}
+
+function manifestWithApprovedPlan(manifest, approval) {
+  const planText = String(approval.planText || "").trim();
+  return {
+    ...manifest,
+    prompt: `${manifest.prompt || ""}
+
+Approved implementation plan, revision ${approval.planRevision}:
+
+${planText}
+
+Implement the original task by following the approved plan above. If the plan and repository state conflict, prefer the repository contract and explain the minimal deviation in the final output.`,
+    plan_mode: {
+      ...(manifest.plan_mode || {}),
+      approved_plan_revision: approval.planRevision,
+      approved_plan_text: planText,
+    },
+  };
+}
+
+async function planModeOIDCToken(manifest, options = {}) {
+  const planMode = planModeConfig(manifest);
+  const audience =
+    options.oidcAudience ||
+    (options.baseEnv && options.baseEnv.INPUT_OIDC_AUDIENCE) ||
+    callbackBaseURL((planMode && planMode.plan_callback_url) || manifest.callback_url);
+  const requester = options.requestOIDCToken || requestOIDCToken;
+  const token = await requester(audience);
+  addMask(token);
+  return token;
+}
+
+async function postPlanProposal(manifest, token, proposal) {
+  const planMode = planModeConfig(manifest);
+  const response = await fetch(planMode.plan_callback_url, {
+    method: "POST",
+    headers: planHTTPHeaders(token),
+    body: JSON.stringify({
+      event_type: "plan_proposed",
+      occurred_at: new Date().toISOString(),
+      plan_proposal: proposal,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`graph-agent plan proposal failed with ${response.status}: ${await response.text()}`);
+  }
+}
+
+async function waitForPlanDecision(manifest, token, request) {
+  const planMode = planModeConfig(manifest);
+  const response = await fetch(planMode.plan_decision_url, {
+    method: "POST",
+    headers: planHTTPHeaders(token),
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) {
+    throw new Error(`graph-agent plan decision wait failed with ${response.status}: ${await response.text()}`);
+  }
+  return response.json();
+}
+
+function planHTTPHeaders(token) {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+}
+
+function callbackBaseURL(callbackURL) {
+  const url = new URL(callbackURL);
+  return `${url.protocol}//${url.host}`;
+}
+
+function planTextFromOutput(stdout) {
+  const parsed = extractJSONObject(stdout);
+  const candidate = planTextCandidate(parsed);
+  const text = stripANSIEscapes(candidate || stdout).trim();
+  if (!text) {
+    throw new Error("plan generation did not produce plan text");
+  }
+  return text;
+}
+
+function planTextCandidate(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "";
+  }
+  if (typeof parsed.plan_text === "string") {
+    return parsed.plan_text;
+  }
+  if (parsed.structured_output && typeof parsed.structured_output === "object") {
+    return planTextCandidate(parsed.structured_output);
+  }
+  if (typeof parsed.structured_output === "string") {
+    return parsed.structured_output;
+  }
+  if (parsed.result && typeof parsed.result === "object") {
+    return planTextCandidate(parsed.result);
+  }
+  if (typeof parsed.result === "string") {
+    return parsed.result;
+  }
+  if (typeof parsed.message === "string") {
+    return parsed.message;
+  }
+  return "";
+}
+
+function stripANSIEscapes(value) {
+  return String(value || "").replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
 function shellCommand(command) {
   return ["bash", "-lc", command];
 }
@@ -1122,6 +1455,10 @@ function looksLikeGraphUpdateSchema(value) {
 
 function manifestSecretValues(manifest) {
   const values = [manifest.prompt, runtimePrompt(manifest), ...graphUpdateContextSecretValues(manifest.graph_update_context)];
+  if (manifest.plan_mode && typeof manifest.plan_mode === "object") {
+    values.push(manifest.plan_mode.approved_plan_text);
+    values.push(manifest.plan_mode.revision_notes);
+  }
   for (const value of Object.values(manifest.agent_runtime_environment || {})) {
     values.push(value);
   }
@@ -1362,11 +1699,7 @@ function byteLength(value) {
 }
 
 if (require.main === require.cache[eval('__filename')]) {
-  try {
-    main();
-  } catch (error) {
-    fail(error);
-  }
+  main().catch(fail);
 }
 
 module.exports = {
@@ -1376,13 +1709,18 @@ module.exports = {
   graphUpdateDraftSchema,
   graphUpdateDraftFromOutput,
   graphUpdateDraftCandidate,
+  isPlanModeEnabled,
   manifestSecretValues,
+  manifestWithApprovedPlan,
+  planGenerationPrompt,
+  planTextFromOutput,
   prepareClaudeCodeAuthentication,
   prepareCodexAuthentication,
   prepareOpenCodeAuthentication,
   prepareRuntimeAuthentication,
   runtimeAuthStatus,
   runtimeCommand,
+  runPlanApprovalLoop,
   runAgent,
   sanitizeText,
   shouldCreatePullRequest,
