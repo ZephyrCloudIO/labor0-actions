@@ -1,19 +1,20 @@
 "use strict";
 
 const fs = require("node:fs");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const path = require("node:path");
 const YAML = require("yaml");
-const { debug, fail, getInput, info, isDebugMode, setOutput, writeJSON } = require("../lib/core");
+const { addMask, debug, fail, getInput, info, isDebugMode, setOutput, writeJSON } = require("../lib/core");
+const { requestOIDCToken } = require("../lib/github-oidc");
 const { readManifest } = require("../lib/manifest");
 const { redact } = require("../lib/redaction");
 
-function main() {
+async function main() {
   const manifest = readManifest(getInput("manifest_path", { required: true }));
-  runAgent(manifest);
+  await runAgent(manifest);
 }
 
-function runAgent(manifest, options = {}) {
+async function runAgent(manifest, options = {}) {
   const baseEnv = options.env || process.env;
   const tempDir = options.tempDir || baseEnv.RUNNER_TEMP || process.cwd();
   const resultPath = path.join(tempDir, "labor0-agent-task-result.json");
@@ -31,6 +32,9 @@ function runAgent(manifest, options = {}) {
   let result = { status: 1, signal: null, stdout: "", stderr: "" };
   let draftParseError = "";
   let runError = null;
+  let planModeDecision = "not_required";
+  let planModeRequestID = "";
+  let planResult = null;
   const startedAt = new Date();
 
   try {
@@ -38,12 +42,25 @@ function runAgent(manifest, options = {}) {
     const runtimeValidator = options.validateRuntimeAuth || validateRuntimeAuth;
     const runtimeInstaller = options.installRuntime || installRuntime;
     const runtimeAuthPreparer = options.prepareRuntimeAuthentication || prepareRuntimeAuthentication;
+    const cwd = options.cwd || baseEnv.GITHUB_WORKSPACE || process.cwd();
     runtimeValidator(manifest, env);
     runtimeInstaller(manifest.agent_runtime_type);
     runtimeAuthPreparer(manifest, env, { tempDir });
-    command = runtimeCommand(manifest, { env: baseEnv });
-    const cwd = options.cwd || baseEnv.GITHUB_WORKSPACE || process.cwd();
     recordDebug(debugLines, baseEnv, secrets, "manifest", manifestDebugSummary(manifest));
+    if (isPlanModeEnabled(manifest)) {
+      const planGate = await runPlanModeGate(manifest, {
+        ...options,
+        baseEnv,
+        cwd,
+        env,
+        debugLines,
+        secrets,
+      });
+      planModeDecision = planGate.decision;
+      planModeRequestID = planGate.ttyRequestId || "";
+      planResult = planGate.result || null;
+    }
+    command = runtimeCommand(manifest, { env: baseEnv });
     recordDebug(debugLines, baseEnv, secrets, "runtime command", commandForDebug(command, manifest, secrets));
     info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
     const spawner = options.spawnSync || spawnSync;
@@ -80,6 +97,11 @@ function runAgent(manifest, options = {}) {
       }
     }
   } catch (error) {
+    if (error && error.planModeDecision) {
+      planModeDecision = error.planModeDecision;
+      planModeRequestID = error.planModeRequestID || planModeRequestID;
+      planResult = error.planResult || planResult;
+    }
     runError = error;
     recordDebug(
       debugLines,
@@ -99,6 +121,15 @@ function runAgent(manifest, options = {}) {
     agent_runtime_type: manifest.agent_runtime_type,
     agent_model: manifest.agent_model || "",
     debug_enabled: debugEnabled,
+    plan_mode_enabled: isPlanModeEnabled(manifest),
+    plan_mode_decision: planModeDecision,
+    plan_mode_tty_request_id: planModeRequestID || undefined,
+    plan_exit_code: planResult ? (planResult.status ?? 1) : undefined,
+    plan_signal: planResult ? planResult.signal : undefined,
+    plan_stdout_bytes: planResult ? byteLength(planResult.stdout || "") : undefined,
+    plan_stderr_bytes: planResult ? byteLength(planResult.stderr || "") : undefined,
+    plan_stdout_tail: planResult ? sanitizeText(tail(planResult.stdout || ""), secrets) : undefined,
+    plan_stderr_tail: planResult ? sanitizeText(tail(planResult.stderr || ""), secrets) : undefined,
     graph_update_draft_created: Boolean(graphUpdateDraft),
     pull_request_count: pullRequests.length,
     exit_code: result.status ?? 1,
@@ -183,6 +214,338 @@ function installNpmPackageIfMissing(binary, packageName) {
 
 function commandExists(binary) {
   return spawnSync(binary, ["--version"], { encoding: "utf8" }).status === 0;
+}
+
+async function runPlanModeGate(manifest, options = {}) {
+  const planMode = planModeConfig(manifest);
+  if (!planMode.enabled) {
+    return { decision: "not_required" };
+  }
+  if (manifest.agent_task_purpose !== "coding") {
+    throw new Error("Plan mode is supported only for coding agent tasks");
+  }
+  validatePlanModeRelay(planMode);
+
+  const relay = options.planModeRelay || (await createPlanModeRelay(planMode, manifest, options));
+  await relay.sessionState("active", "Plan phase started.");
+  const planCommand = runtimePlanCommand(manifest, { env: options.baseEnv || process.env });
+  recordDebug(options.debugLines, options.baseEnv || process.env, options.secrets, "plan command", commandForDebug(planCommand, manifest, options.secrets));
+  info(`Running ${manifest.agent_runtime_type || "agent"} plan phase`);
+
+  const planRunner = options.runPlanCommand || runCommandStreaming;
+  const result = await planRunner(planCommand, {
+    cwd: options.cwd || (options.baseEnv && options.baseEnv.GITHUB_WORKSPACE) || process.cwd(),
+    env: options.env || process.env,
+    onStdout: (data) => relay.output(data, false),
+    onStderr: (data) => relay.output(data, true),
+  });
+  recordDebug(options.debugLines, options.baseEnv || process.env, options.secrets, "plan result", runtimeResultSummary(result));
+  recordDebug(options.debugLines, options.baseEnv || process.env, options.secrets, "plan output tail", {
+    stdout_tail: sanitizeText(tail(result.stdout || "", 4000), options.secrets),
+    stderr_tail: sanitizeText(tail(result.stderr || "", 4000), options.secrets),
+  });
+  if (result.status !== 0) {
+    await bestEffort(() => relay.sessionState("failed", `Plan phase exited with ${result.status ?? result.signal}`));
+    throw new Error(`${planCommand[0]} plan phase exited with ${result.status ?? result.signal}`);
+  }
+
+  const approval = await relay.approvalRequest({
+    prompt: "Review and approve the plan before implementation continues.",
+    description: planApprovalDescription(manifest, result, options.secrets),
+  });
+  const ttyRequestId = String((approval && (approval.tty_request_id || approval.ttyRequestId)) || "");
+  if (!ttyRequestId) {
+    throw new Error("plan-mode approval relay did not return tty_request_id");
+  }
+
+  const decision = await waitForPlanApproval(relay, ttyRequestId, options);
+  if (decision === "approved") {
+    await reportPlanModeEvent(manifest, "plan_mode_approved", options);
+    return { decision, ttyRequestId, result };
+  }
+
+  await reportPlanModeEvent(manifest, "plan_mode_rejected", options);
+  await bestEffort(() => relay.sessionState("failed", "Plan was rejected."));
+  const error = new Error("plan mode request was rejected");
+  error.planModeDecision = "rejected";
+  error.planModeRequestID = ttyRequestId;
+  error.planResult = result;
+  throw error;
+}
+
+function isPlanModeEnabled(manifest) {
+  return Boolean(manifest && manifest.plan_mode && manifest.plan_mode.enabled);
+}
+
+function planModeConfig(manifest) {
+  const planMode = (manifest && manifest.plan_mode) || {};
+  return {
+    enabled: Boolean(planMode.enabled),
+    state: planMode.state || "",
+    targetUserGroupId: planMode.target_user_group_id || planMode.targetUserGroupId || "",
+    mobileTtySessionId: planMode.mobile_tty_session_id || planMode.mobileTtySessionId || "",
+    relayOutputURL: planMode.relay_output_url || planMode.relayOutputUrl || "",
+    relayApprovalRequestURL: planMode.relay_approval_request_url || planMode.relayApprovalRequestUrl || "",
+    relaySessionStateURL: planMode.relay_session_state_url || planMode.relaySessionStateUrl || "",
+    relayHeartbeatURL: planMode.relay_heartbeat_url || planMode.relayHeartbeatUrl || "",
+    relayTranscriptWindowURL: planMode.relay_transcript_window_url || planMode.relayTranscriptWindowUrl || "",
+  };
+}
+
+function validatePlanModeRelay(planMode) {
+  const missing = [];
+  for (const [key, value] of Object.entries({
+    mobile_tty_session_id: planMode.mobileTtySessionId,
+    relay_output_url: planMode.relayOutputURL,
+    relay_approval_request_url: planMode.relayApprovalRequestURL,
+    relay_session_state_url: planMode.relaySessionStateURL,
+    relay_heartbeat_url: planMode.relayHeartbeatURL,
+    relay_transcript_window_url: planMode.relayTranscriptWindowURL,
+  })) {
+    if (!String(value || "").trim()) {
+      missing.push(key);
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(`plan_mode manifest is missing ${missing.join(", ")}`);
+  }
+}
+
+async function createPlanModeRelay(planMode, manifest, options = {}) {
+  const oidc = options.requestOIDCToken || requestOIDCToken;
+  const token = await oidc(relayAudience(planMode));
+  addMask(token);
+  const fetcher = options.fetch || fetch;
+  return {
+    output: (data, stderr) => postRelayJSON(fetcher, planMode.relayOutputURL, token, { data: String(data || ""), stderr }),
+    approvalRequest: (payload) => postRelayJSON(fetcher, planMode.relayApprovalRequestURL, token, payload),
+    sessionState: (sessionState, reason) =>
+      postRelayJSON(fetcher, planMode.relaySessionStateURL, token, { session_state: sessionState, reason }),
+    heartbeat: () => postRelayJSON(fetcher, planMode.relayHeartbeatURL, token, {}),
+    transcriptWindow: (payload) => postRelayJSON(fetcher, planMode.relayTranscriptWindowURL, token, payload),
+  };
+}
+
+function relayAudience(planMode) {
+  const url = new URL(planMode.relayOutputURL);
+  return `${url.protocol}//${url.host}`;
+}
+
+async function postRelayJSON(fetcher, url, token, payload) {
+  const response = await fetcher(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload || {}),
+  });
+  if (!response.ok) {
+    throw new Error(`plan-mode relay ${url} failed with ${response.status}: ${await response.text()}`);
+  }
+  return response.json();
+}
+
+async function waitForPlanApproval(relay, ttyRequestId, options = {}) {
+  const baseEnv = options.baseEnv || options.env || process.env;
+  const timeoutMs = positiveNumber(
+    options.approvalTimeoutMs,
+    Number(baseEnv.LABOR0_PLAN_MODE_APPROVAL_TIMEOUT_MS || 24 * 60 * 60 * 1000),
+  );
+  const intervalMs = positiveNumber(
+    options.approvalPollIntervalMs,
+    Number(baseEnv.LABOR0_PLAN_MODE_APPROVAL_POLL_INTERVAL_MS || 10 * 1000),
+  );
+  const sleepFn = options.sleep || sleep;
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    await bestEffort(() => relay.heartbeat());
+    const transcript = await relay.transcriptWindow({ limit: 100 });
+    const decision = planApprovalDecisionFromTranscript(transcript, ttyRequestId);
+    if (decision) {
+      return decision;
+    }
+    if (Date.now() >= deadline) {
+      await bestEffort(() => relay.sessionState("expired", "Plan approval timed out."));
+      throw new Error("plan mode approval timed out");
+    }
+    await sleepFn(Math.min(intervalMs, Math.max(deadline - Date.now(), 1)));
+  }
+}
+
+function planApprovalDecisionFromTranscript(transcript, ttyRequestId) {
+  const entries = Array.isArray(transcript && transcript.entries) ? transcript.entries : [];
+  for (const entry of entries.slice().reverse()) {
+    const status = entry.ttyRequestStatus || entry.tty_request_status;
+    if (!status) {
+      continue;
+    }
+    const statusRequestId = status.ttyRequestId || status.tty_request_id || entry.ttyRequestId || entry.tty_request_id || "";
+    if (statusRequestId !== ttyRequestId) {
+      continue;
+    }
+    const resolutionKind = String(
+      status.resolutionKind ||
+        status.resolution_kind ||
+        (status.acceptedResponse && (status.acceptedResponse.resolutionKind || status.acceptedResponse.resolution_kind)) ||
+        "",
+    ).toLowerCase();
+    const state = String(status.state || "").toLowerCase();
+    if (resolutionKind.endsWith("approved") || resolutionKind === "approved") {
+      return "approved";
+    }
+    if (resolutionKind.endsWith("rejected") || resolutionKind === "rejected" || state.endsWith("rejected")) {
+      return "rejected";
+    }
+  }
+  return "";
+}
+
+async function reportPlanModeEvent(manifest, eventType, options = {}) {
+  if (options.reportEvent) {
+    return options.reportEvent(eventType);
+  }
+  const oidc = options.requestOIDCToken || requestOIDCToken;
+  const token = await oidc(callbackBaseURL(manifest));
+  addMask(token);
+  const response = await (options.fetch || fetch)(manifest.callback_url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      event_type: eventType,
+      occurred_at: new Date().toISOString(),
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`graph-agent plan-mode event report failed with ${response.status}: ${await response.text()}`);
+  }
+  info(`Reported ${eventType} for session ${manifest.agent_task_session_id}`);
+}
+
+function callbackBaseURL(manifest) {
+  const url = new URL(manifest.callback_url);
+  return `${url.protocol}//${url.host}`;
+}
+
+function runtimePlanCommand(manifest, options = {}) {
+  const prompt = planModePrompt(manifest);
+  const env = options.env || process.env;
+  if (env.LABOR0_AGENT_PLAN_COMMAND) {
+    return shellCommand(env.LABOR0_AGENT_PLAN_COMMAND);
+  }
+  switch (manifest.agent_runtime_type) {
+    case "codex":
+      return compact([
+        "codex",
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        manifest.agent_model ? "--model" : "",
+        manifest.agent_model || "",
+        prompt,
+      ]);
+    case "claude_code":
+      return compact([
+        "claude",
+        "-p",
+        "--permission-mode",
+        "plan",
+        manifest.agent_model ? "--model" : "",
+        manifest.agent_model || "",
+        prompt,
+      ]);
+    case "opencode":
+      return compact([
+        "opencode",
+        "run",
+        "--agent",
+        "plan",
+        manifest.agent_model ? "--model" : "",
+        manifest.agent_model || "",
+        prompt,
+      ]);
+    default:
+      throw new Error(`Unsupported agent_runtime_type: ${manifest.agent_runtime_type || "(empty)"}`);
+  }
+}
+
+function planModePrompt(manifest) {
+  return `${manifest.prompt || ""}
+
+Before implementation, produce a concise execution plan for human approval. Do not edit files, create commits, open pull requests, or make implementation changes during this plan phase.`;
+}
+
+function planApprovalDescription(manifest, result, secrets) {
+  const parts = [
+    `Task: ${manifest.task_title || manifest.agent_task_id || "Labor0 agent task"}`,
+    `Runtime: ${manifest.agent_runtime_type}${manifest.agent_model ? ` (${manifest.agent_model})` : ""}`,
+  ];
+  const stdout = sanitizeText(tail(result.stdout || "", 6000), secrets);
+  const stderr = sanitizeText(tail(result.stderr || "", 2000), secrets);
+  if (stdout) {
+    parts.push(`Plan output:\n${stdout}`);
+  }
+  if (stderr) {
+    parts.push(`Plan warnings:\n${stderr}`);
+  }
+  return parts.join("\n\n");
+}
+
+function runCommandStreaming(command, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command[0], command.slice(1), {
+      cwd: options.cwd || process.cwd(),
+      env: options.env || process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let relayQueue = Promise.resolve();
+    child.stdout.on("data", (chunk) => {
+      const data = chunk.toString("utf8");
+      stdout += data;
+      if (options.onStdout) {
+        relayQueue = relayQueue.then(() => options.onStdout(data));
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      const data = chunk.toString("utf8");
+      stderr += data;
+      if (options.onStderr) {
+        relayQueue = relayQueue.then(() => options.onStderr(data));
+      }
+    });
+    child.on("error", reject);
+    child.on("close", (status, signal) => {
+      relayQueue
+        .then(() => resolve({ status, signal, stdout, stderr }))
+        .catch(reject);
+    });
+  });
+}
+
+function positiveNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function bestEffort(fn) {
+  try {
+    await fn();
+  } catch {
+    // Best-effort relay updates must not hide the primary plan-mode outcome.
+  }
 }
 
 function runtimeCommand(manifest, options = {}) {
@@ -1158,11 +1521,7 @@ function byteLength(value) {
 }
 
 if (require.main === module) {
-  try {
-    main();
-  } catch (error) {
-    fail(error);
-  }
+  main().catch(fail);
 }
 
 module.exports = {
@@ -1177,8 +1536,10 @@ module.exports = {
   prepareCodexAuthentication,
   prepareOpenCodeAuthentication,
   prepareRuntimeAuthentication,
+  planApprovalDecisionFromTranscript,
   runtimeAuthStatus,
   runtimeCommand,
+  runtimePlanCommand,
   runAgent,
   sanitizeText,
   shouldCreatePullRequest,
