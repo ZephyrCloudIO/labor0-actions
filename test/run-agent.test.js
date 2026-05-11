@@ -10,11 +10,13 @@ const {
   createPullRequestsForChangedRepositories,
   graphUpdateDraftFromOutput,
   graphUpdateDraftSchema,
+  planApprovalDecisionFromTranscript,
   prepareClaudeCodeAuthentication,
   prepareCodexAuthentication,
   prepareOpenCodeAuthentication,
   runtimeAuthStatus,
   runtimeCommand,
+  runtimePlanCommand,
   runAgent,
   shouldCreatePullRequest,
   shouldUpdateExistingPullRequest,
@@ -92,6 +94,33 @@ test("opencode command passes model and permission bypass", () => {
     "openai/gpt-5.4",
     "Implement runtime auth",
   ]);
+});
+
+test("plan mode commands use runtime-specific read-only planning", () => {
+  assert.deepEqual(
+    runtimePlanCommand({
+      agent_runtime_type: "codex",
+      agent_model: "gpt-5.4",
+      prompt: "Implement runtime auth",
+    }).slice(0, 5),
+    ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check"],
+  );
+  assert.deepEqual(
+    runtimePlanCommand({
+      agent_runtime_type: "claude_code",
+      agent_model: "claude-sonnet-4-6",
+      prompt: "Implement runtime auth",
+    }).slice(0, 4),
+    ["claude", "-p", "--permission-mode", "plan"],
+  );
+  assert.deepEqual(
+    runtimePlanCommand({
+      agent_runtime_type: "opencode",
+      agent_model: "openai/gpt-5.4",
+      prompt: "Implement runtime auth",
+    }).slice(0, 4),
+    ["opencode", "run", "--agent", "plan"],
+  );
 });
 
 test("runtime auth validation reports missing provider credentials", () => {
@@ -539,13 +568,12 @@ test("graph update draft extraction accepts Claude Code structured output envelo
   assert.equal(draft.task_drafts[0].draft_task_key, "implement-runtime");
 });
 
-test("graph update parse failure writes result output before failing", () => {
+test("graph update parse failure writes result output before failing", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-run-agent-test-"));
   const outputs = {};
   const manifest = graphUpdateManifest();
 
-  assert.throws(
-    () =>
+  await assert.rejects(
       runAgent(manifest, {
         tempDir,
         cwd: tempDir,
@@ -573,13 +601,12 @@ test("graph update parse failure writes result output before failing", () => {
   assert.match(result.stderr_tail, /no structured output/);
 });
 
-test("graph update validation failure writes result output before failing", () => {
+test("graph update validation failure writes result output before failing", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-run-agent-validation-test-"));
   const outputs = {};
   const manifest = graphUpdateManifest();
 
-  assert.throws(
-    () =>
+  await assert.rejects(
       runAgent(manifest, {
         tempDir,
         cwd: tempDir,
@@ -628,7 +655,7 @@ test("graph update draft schema requires nested edge refs", () => {
   assert.equal(schema.properties.remove_edges.items.properties.successor.properties.draft_task_key, undefined);
 });
 
-test("debug diagnostics redact prompt, runtime secrets, and repository tokens", () => {
+test("debug diagnostics redact prompt, runtime secrets, and repository tokens", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-run-agent-debug-test-"));
   const outputs = {};
   const manifest = graphUpdateManifest({
@@ -671,7 +698,7 @@ test("debug diagnostics redact prompt, runtime secrets, and repository tokens", 
     "ghs-private-token",
   ].join("\n");
 
-  runAgent(manifest, {
+  await runAgent(manifest, {
     tempDir,
     cwd: tempDir,
     env: { LABOR0_AGENT_DEBUG: "true", RUNNER_TEMP: tempDir },
@@ -716,6 +743,160 @@ test("debug detection honors runner and Labor0 agent debug environment", () => {
   assert.equal(isDebugMode({}), false);
   assert.equal(isDebugMode({ RUNNER_DEBUG: "1" }), true);
   assert.equal(isDebugMode({ LABOR0_AGENT_DEBUG: "true" }), true);
+});
+
+test("plan approval streams output and continues implementation", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-plan-approve-test-"));
+  const outputs = {};
+  const events = [];
+  const relayedOutput = [];
+  let planCommand = [];
+  const manifest = codingManifest({
+    plan_mode: planModeManifest(),
+  });
+
+  await runAgent(manifest, {
+    tempDir,
+    cwd: tempDir,
+    env: { OPENAI_API_KEY: "sk-test", RUNNER_TEMP: tempDir },
+    installRuntime: () => {},
+    prepareRuntimeAuthentication: () => {},
+    createPullRequestsForChangedRepositories: () => [],
+    setOutput: (name, value) => {
+      outputs[name] = value;
+    },
+    runPlanCommand: async (command, hooks) => {
+      planCommand = command;
+      await hooks.onStdout("Plan step 1\n");
+      await hooks.onStderr("Plan warning\n");
+      return { status: 0, signal: null, stdout: "Plan step 1\n", stderr: "Plan warning\n" };
+    },
+    spawnSync: () => ({
+      status: 0,
+      signal: null,
+      stdout: "implementation completed",
+      stderr: "",
+    }),
+    planModeRelay: {
+      output: async (data, stderr) => relayedOutput.push({ data, stderr }),
+      sessionState: async () => {},
+      heartbeat: async () => {},
+      approvalRequest: async () => ({ tty_request_id: "0199e7be-9000-7000-8000-000000000099" }),
+      transcriptWindow: async () => ({
+        entries: [
+          {
+            ttyRequestStatus: {
+              ttyRequestId: "0199e7be-9000-7000-8000-000000000099",
+              state: "TTY_REQUEST_STATE_RESOLVED",
+              resolutionKind: "TTY_REQUEST_RESOLUTION_KIND_APPROVED",
+            },
+          },
+        ],
+      }),
+    },
+    reportEvent: async (eventType) => events.push(eventType),
+  });
+
+  assert.deepEqual(planCommand.slice(0, 5), ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check"]);
+  assert.deepEqual(relayedOutput, [
+    { data: "Plan step 1\n", stderr: false },
+    { data: "Plan warning\n", stderr: true },
+  ]);
+  assert.deepEqual(events, ["plan_mode_approved"]);
+  const result = JSON.parse(fs.readFileSync(outputs.result_path, "utf8"));
+  assert.equal(result.plan_mode_enabled, true);
+  assert.equal(result.plan_mode_decision, "approved");
+  assert.equal(result.plan_mode_tty_request_id, "0199e7be-9000-7000-8000-000000000099");
+  assert.equal(result.exit_code, 0);
+});
+
+test("plan rejection reports rejection and skips implementation", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-plan-reject-test-"));
+  const outputs = {};
+  const events = [];
+  let implementationStarted = false;
+  const manifest = codingManifest({
+    plan_mode: planModeManifest(),
+  });
+
+  await assert.rejects(
+    runAgent(manifest, {
+      tempDir,
+      cwd: tempDir,
+      env: { OPENAI_API_KEY: "sk-test", RUNNER_TEMP: tempDir },
+      installRuntime: () => {},
+      prepareRuntimeAuthentication: () => {},
+      setOutput: (name, value) => {
+        outputs[name] = value;
+      },
+      runPlanCommand: async () => ({ status: 0, signal: null, stdout: "Plan step 1\n", stderr: "" }),
+      spawnSync: () => {
+        implementationStarted = true;
+        return { status: 0, signal: null, stdout: "", stderr: "" };
+      },
+      planModeRelay: {
+        output: async () => {},
+        sessionState: async () => {},
+        heartbeat: async () => {},
+        approvalRequest: async () => ({ tty_request_id: "0199e7be-9000-7000-8000-000000000099" }),
+        transcriptWindow: async () => ({
+          entries: [
+            {
+              ttyRequestStatus: {
+                ttyRequestId: "0199e7be-9000-7000-8000-000000000099",
+                state: "TTY_REQUEST_STATE_REJECTED",
+                resolutionKind: "TTY_REQUEST_RESOLUTION_KIND_REJECTED",
+              },
+            },
+          ],
+        }),
+      },
+      reportEvent: async (eventType) => events.push(eventType),
+    }),
+    /plan mode request was rejected/,
+  );
+
+  assert.equal(implementationStarted, false);
+  assert.deepEqual(events, ["plan_mode_rejected"]);
+  const result = JSON.parse(fs.readFileSync(outputs.result_path, "utf8"));
+  assert.equal(result.plan_mode_decision, "rejected");
+  assert.match(result.error_message, /plan mode request was rejected/);
+});
+
+test("plan approval parser recognizes approved and rejected transcript status", () => {
+  assert.equal(
+    planApprovalDecisionFromTranscript(
+      {
+        entries: [
+          {
+            tty_request_status: {
+              tty_request_id: "req-1",
+              state: "TTY_REQUEST_STATE_RESOLVED",
+              resolution_kind: "TTY_REQUEST_RESOLUTION_KIND_APPROVED",
+            },
+          },
+        ],
+      },
+      "req-1",
+    ),
+    "approved",
+  );
+  assert.equal(
+    planApprovalDecisionFromTranscript(
+      {
+        entries: [
+          {
+            ttyRequestStatus: {
+              ttyRequestId: "req-1",
+              state: "TTY_REQUEST_STATE_REJECTED",
+            },
+          },
+        ],
+      },
+      "req-1",
+    ),
+    "rejected",
+  );
 });
 
 test("pull request creation defaults on for read-write repositories only", () => {
@@ -870,6 +1051,43 @@ function graphUpdateManifest(overrides = {}) {
     prompt: "Plan follow-up tasks",
     graph_update_context: graphUpdateContext(),
     repositories: [],
+    ...overrides,
+  };
+}
+
+function codingManifest(overrides = {}) {
+  return {
+    agent_task_session_id: "0199e7be-9000-7000-8000-000000000001",
+    agent_task_id: "0199e7be-9000-7000-8000-000000000010",
+    graph_agent_task_id: "0199e7be-9000-7000-8000-000000000020",
+    task_title: "Implement runtime auth",
+    agent_task_purpose: "coding",
+    agent_runtime_type: "codex",
+    agent_model: "gpt-5.4",
+    prompt: "Implement runtime auth",
+    callback_url:
+      "https://graph-agent.example.test/github-actions/agent-task-sessions/0199e7be-9000-7000-8000-000000000001/events",
+    repositories: [],
+    ...overrides,
+  };
+}
+
+function planModeManifest(overrides = {}) {
+  return {
+    enabled: true,
+    state: "requested",
+    target_user_group_id: "0199e7be-9000-7000-8000-000000000030",
+    mobile_tty_session_id: "0199e7be-9000-7000-8000-000000000040",
+    relay_output_url:
+      "https://graph-agent.example.test/github-actions/agent-task-sessions/0199e7be-9000-7000-8000-000000000001/mobile-tty/output",
+    relay_approval_request_url:
+      "https://graph-agent.example.test/github-actions/agent-task-sessions/0199e7be-9000-7000-8000-000000000001/mobile-tty/approval-request",
+    relay_session_state_url:
+      "https://graph-agent.example.test/github-actions/agent-task-sessions/0199e7be-9000-7000-8000-000000000001/mobile-tty/session-state",
+    relay_heartbeat_url:
+      "https://graph-agent.example.test/github-actions/agent-task-sessions/0199e7be-9000-7000-8000-000000000001/mobile-tty/heartbeat",
+    relay_transcript_window_url:
+      "https://graph-agent.example.test/github-actions/agent-task-sessions/0199e7be-9000-7000-8000-000000000001/mobile-tty/transcript-window",
     ...overrides,
   };
 }
