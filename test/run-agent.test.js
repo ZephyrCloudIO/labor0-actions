@@ -70,12 +70,43 @@ test("claude command passes model without structured output schema", () => {
   assert.equal(command[0], "claude");
   assert.equal(command[1], "-p");
   assert.deepEqual(command.slice(2, 4), ["--permission-mode", "bypassPermissions"]);
+  assert.equal(command.includes("--add-dir"), false);
   assert.equal(command.includes("--output-format"), false);
   assert.equal(command.includes("--json-schema"), false);
   assert.equal(command.includes("json"), false);
   assert.equal(command[4], "--model");
   assert.equal(command[5], "claude-sonnet-4-6");
   assert.match(command.at(-1), /Return only one YAML document/);
+});
+
+test("claude command adds every repository checkout directory before permission mode", () => {
+  const command = runtimeCommand(
+    {
+      agent_runtime_type: "claude_code",
+      agent_task_purpose: "coding",
+      agent_model: "claude-sonnet-4-6",
+      prompt: "Implement multi-repo task",
+      repositories: [
+        {
+          repository_id: "0199e7be-9000-7000-8000-000000000003",
+          checkout_path: "repositories/0199e7be-9000-7000-8000-000000000003",
+        },
+        {
+          repository_id: "0199e7be-9000-7000-8000-000000000004",
+          checkout_path: "workspace repo/docs",
+        },
+      ],
+    },
+    { env: { GITHUB_WORKSPACE: "/tmp/labor0-workspace" } },
+  );
+
+  assert.deepEqual(command.slice(0, 2), ["claude", "-p"]);
+  assert.equal(command[2], "--add-dir");
+  assert.deepEqual(command.slice(3, 5), [
+    "/tmp/labor0-workspace/repositories/0199e7be-9000-7000-8000-000000000003",
+    "/tmp/labor0-workspace/workspace repo/docs",
+  ]);
+  assert.deepEqual(command.slice(5, 7), ["--permission-mode", "bypassPermissions"]);
 });
 
 test("opencode command passes model and permission bypass", () => {
@@ -113,6 +144,14 @@ test("plan mode commands use runtime-specific read-only planning", () => {
     }).slice(0, 4),
     ["claude", "-p", "--permission-mode", "plan"],
   );
+  assert.equal(
+    runtimePlanCommand({
+      agent_runtime_type: "claude_code",
+      agent_model: "claude-sonnet-4-6",
+      prompt: "Implement runtime auth",
+    }).includes("--add-dir"),
+    false,
+  );
   assert.deepEqual(
     runtimePlanCommand({
       agent_runtime_type: "opencode",
@@ -121,6 +160,35 @@ test("plan mode commands use runtime-specific read-only planning", () => {
     }).slice(0, 4),
     ["opencode", "run", "--agent", "plan"],
   );
+});
+
+test("claude plan command adds every repository checkout directory before permission mode", () => {
+  const command = runtimePlanCommand(
+    {
+      agent_runtime_type: "claude_code",
+      agent_model: "claude-sonnet-4-6",
+      prompt: "Implement runtime auth",
+      repositories: [
+        {
+          repository_id: "0199e7be-9000-7000-8000-000000000003",
+          checkout_path: "repositories/0199e7be-9000-7000-8000-000000000003",
+        },
+        {
+          repository_id: "0199e7be-9000-7000-8000-000000000004",
+          checkout_path: "workspace repo/docs",
+        },
+      ],
+    },
+    { env: { GITHUB_WORKSPACE: "/tmp/labor0-workspace" } },
+  );
+
+  assert.deepEqual(command.slice(0, 2), ["claude", "-p"]);
+  assert.equal(command[2], "--add-dir");
+  assert.deepEqual(command.slice(3, 5), [
+    "/tmp/labor0-workspace/repositories/0199e7be-9000-7000-8000-000000000003",
+    "/tmp/labor0-workspace/workspace repo/docs",
+  ]);
+  assert.deepEqual(command.slice(5, 7), ["--permission-mode", "plan"]);
 });
 
 test("runtime auth validation reports missing provider credentials", () => {

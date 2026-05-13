@@ -695,6 +695,7 @@ function runtimePlanCommand(manifest, options = {}) {
       return compact([
         "claude",
         "-p",
+        ...claudeAdditionalDirectoryArgs(manifest, options),
         "--permission-mode",
         "plan",
         manifest.agent_model ? "--model" : "",
@@ -811,6 +812,7 @@ function runtimeCommand(manifest, options = {}) {
       return compact([
         "claude",
         "-p",
+        ...claudeAdditionalDirectoryArgs(manifest, options),
         "--permission-mode",
         "bypassPermissions",
         manifest.agent_model ? "--model" : "",
@@ -829,6 +831,32 @@ function runtimeCommand(manifest, options = {}) {
     default:
       throw new Error(`Unsupported agent_runtime_type: ${manifest.agent_runtime_type || "(empty)"}`);
   }
+}
+
+function claudeAdditionalDirectoryArgs(manifest, options = {}) {
+  const directories = claudeAdditionalDirectories(manifest, options);
+  return directories.length > 0 ? ["--add-dir", ...directories] : [];
+}
+
+function claudeAdditionalDirectories(manifest, options = {}) {
+  const repositories = Array.isArray(manifest && manifest.repositories) ? manifest.repositories : [];
+  const workspace = runnerWorkspace(options);
+  const directories = [];
+  for (const repository of repositories) {
+    const checkoutPath = String(
+      (repository && repository.checkout_path) || `repositories/${repository && repository.repository_id}`,
+    ).trim();
+    if (!checkoutPath || checkoutPath === "repositories/undefined") {
+      continue;
+    }
+    directories.push(path.resolve(workspace, checkoutPath));
+  }
+  return directories;
+}
+
+function runnerWorkspace(options = {}) {
+  const env = options.env || process.env;
+  return options.cwd || env.GITHUB_WORKSPACE || process.cwd();
 }
 
 function validateRuntimeAuth(manifest, env) {
