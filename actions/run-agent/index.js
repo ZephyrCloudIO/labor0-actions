@@ -1024,12 +1024,15 @@ function runtimePrompt(manifest) {
 ${graphContext}
 
 Return only one YAML document matching this shape:
-summary: short summary
+summary: |
+  short summary
 task_drafts:
   - draft_task_key: stable-kebab-key
     task_type: agent_execution
-    title: task title
-    description: task details
+    title: |
+      task title
+    description: |
+      task details
     labels:
       - label
     execution_repository_bindings:
@@ -1053,6 +1056,7 @@ remove_edges:
 For draft edge refs, use nested predecessor/successor objects only.
 Use graph_agent_task_id for existing tasks from the current graph context and draft_task_key for proposed task_drafts.
 Do not use predecessor_task_id or successor_task_id in draft payloads; those names appear only in the current graph context.
+Use quoted strings or block scalars for free-text YAML fields such as summary, title, and description. Prefer block scalars when the text contains punctuation such as ": ".
 Do not wrap the YAML in Markdown.`;
 }
 
@@ -1092,9 +1096,35 @@ function graphUpdateDraftDocumentCandidate(value) {
   try {
     return graphUpdateDraftCandidate(parseGraphUpdateYAML(yamlDocument));
   } catch (error) {
+    const repairedDocument = repairGraphUpdateYAMLFreeTextScalars(yamlDocument);
+    if (repairedDocument !== yamlDocument) {
+      try {
+        return graphUpdateDraftCandidate(parseGraphUpdateYAML(repairedDocument));
+      } catch {
+        // Keep the original parser error so the operator sees the exact emitted YAML failure.
+      }
+    }
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`failed to parse graph_update YAML draft: ${message}`);
   }
+}
+
+function repairGraphUpdateYAMLFreeTextScalars(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((line) => {
+      const match = /^(\s*)(summary|title|description):[ \t]+(.+?)\s*$/.exec(line);
+      if (!match) {
+        return line;
+      }
+      const [, indent, field, rawValue] = match;
+      const trimmedValue = rawValue.trim();
+      if (!/:\s/.test(trimmedValue) || /^[|>'"\[{]/.test(trimmedValue)) {
+        return line;
+      }
+      return `${indent}${field}: |\n${indent}  ${trimmedValue}`;
+    })
+    .join("\n");
 }
 
 function validateGraphUpdateDraftEdgePayloads(draft) {

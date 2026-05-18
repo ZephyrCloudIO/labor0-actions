@@ -446,11 +446,13 @@ test("graph update draft extraction accepts YAML block scalars", () => {
       agent_task_session_id: "0199e7be-9000-7000-8000-000000000009",
       graph_update_context: graphUpdateContext(),
     },
-    `summary: Create multiline task
+    `summary: |
+  Create multiline task: keep YAML text safe.
 task_drafts:
   - draft_task_key: implement-runtime
     task_type: agent_execution
-    title: Implement runtime
+    title: |
+      Implement runtime: first pass
     description: |
       Wire the runtime.
       Keep the graph update parser stable.
@@ -462,9 +464,34 @@ remove_edges: []`,
   );
 
   assert.equal(draft.source_agent_task_session_id, "0199e7be-9000-7000-8000-000000000009");
-  assert.equal(draft.summary, "Create multiline task");
+  assert.equal(draft.summary, "Create multiline task: keep YAML text safe.\n");
+  assert.equal(draft.task_drafts[0].title, "Implement runtime: first pass\n");
   assert.equal(draft.task_drafts[0].description, "Wire the runtime.\nKeep the graph update parser stable.\n");
   assert.deepEqual(draft.task_drafts[0].labels, ["backend"]);
+});
+
+test("graph update draft extraction repairs unquoted free-text colons", () => {
+  const summary =
+    "Three sequential tasks to scaffold a React app, then configure shadcn UI and Zephyr deployment on top of it. Each is independently executable but ordered: shadcn and Zephyr both depend on the React app existing first.";
+  const draft = graphUpdateDraftFromOutput(
+    {
+      agent_task_session_id: "0199e7be-9000-7000-8000-000000000010",
+      graph_update_context: graphUpdateContext(),
+    },
+    `summary: ${summary}
+task_drafts:
+  - draft_task_key: create-react-app
+    task_type: agent_execution
+    title: Create a React app
+    description: Scaffold a React app: use Vite, React, and TypeScript.
+    execution_repository_bindings: []
+upsert_edges: []
+remove_edges: []`,
+  );
+
+  assert.equal(draft.source_agent_task_session_id, "0199e7be-9000-7000-8000-000000000010");
+  assert.equal(draft.summary, `${summary}\n`);
+  assert.equal(draft.task_drafts[0].description, "Scaffold a React app: use Vite, React, and TypeScript.\n");
 });
 
 test("graph update draft extraction accepts fenced YAML with flow refs", () => {
