@@ -834,6 +834,43 @@ test("debug diagnostics redact prompt, runtime secrets, and repository tokens", 
   assert.match(debugArtifact, /\[PROMPT_REDACTED\]/);
 });
 
+test("debug diagnostics honor manifest debug flag without runner environment", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-run-agent-manifest-debug-test-"));
+  const outputs = {};
+  const manifest = codingManifest({
+    debug_mode_enabled: true,
+    agent_runtime_environment: {
+      OPENAI_API_KEY: "sk-openai-private",
+    },
+  });
+
+  await runAgent(manifest, {
+    tempDir,
+    cwd: tempDir,
+    env: { RUNNER_TEMP: tempDir },
+    installRuntime: () => {},
+    prepareRuntimeAuthentication: () => {},
+    createPullRequestsForChangedRepositories: () => [],
+    setOutput: (name, value) => {
+      outputs[name] = value;
+    },
+    spawnSync: () => ({
+      status: 0,
+      signal: null,
+      stdout: "implementation complete",
+      stderr: "",
+    }),
+  });
+
+  assert.ok(outputs.debug_artifact_path);
+  const result = JSON.parse(fs.readFileSync(outputs.result_path, "utf8"));
+  assert.equal(result.debug_enabled, true);
+  const debugArtifact = fs.readFileSync(outputs.debug_artifact_path, "utf8");
+  assert.match(debugArtifact, /runtime command/);
+  assert.equal(debugArtifact.includes("sk-openai-private"), false);
+  assert.equal(JSON.parse(debugArtifact).manifest.debug_mode_enabled, true);
+});
+
 test("debug detection honors runner and Labor0 agent debug environment", () => {
   assert.equal(isDebugMode({}), false);
   assert.equal(isDebugMode({ RUNNER_DEBUG: "1" }), true);
