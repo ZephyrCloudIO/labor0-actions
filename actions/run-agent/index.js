@@ -16,13 +16,14 @@ async function main() {
 
 async function runAgent(manifest, options = {}) {
   const baseEnv = options.env || process.env;
+  const debugEnv = debugModeEnvironment(baseEnv, manifest);
   const tempDir = options.tempDir || baseEnv.RUNNER_TEMP || process.cwd();
   const resultPath = path.join(tempDir, "labor0-agent-task-result.json");
   const debugArtifactPath = path.join(tempDir, "labor0-agent-debug-diagnostics.json");
   const graphUpdateDraftPath = path.join(tempDir, "labor0-graph-update-draft.json");
   const pullRequestsPath = path.join(tempDir, "labor0-agent-task-pull-requests.json");
   const emitOutput = options.setOutput || setOutput;
-  const debugEnabled = isDebugMode(baseEnv);
+  const debugEnabled = isDebugMode(debugEnv);
   const secrets = manifestSecretValues(manifest);
   const debugLines = [];
 
@@ -46,11 +47,12 @@ async function runAgent(manifest, options = {}) {
     runtimeValidator(manifest, env);
     runtimeInstaller(manifest.agent_runtime_type);
     runtimeAuthPreparer(manifest, env, { tempDir });
-    recordDebug(debugLines, baseEnv, secrets, "manifest", manifestDebugSummary(manifest));
+    recordDebug(debugLines, debugEnv, secrets, "manifest", manifestDebugSummary(manifest));
     if (isPlanModeEnabled(manifest)) {
       const planGate = await runPlanModeGate(manifest, {
         ...options,
         baseEnv,
+        debugEnv,
         cwd,
         env,
         debugLines,
@@ -61,7 +63,7 @@ async function runAgent(manifest, options = {}) {
       planResult = planGate.result || null;
     }
     command = runtimeCommand(manifest, { env: baseEnv });
-    recordDebug(debugLines, baseEnv, secrets, "runtime command", commandForDebug(command, manifest, secrets));
+    recordDebug(debugLines, debugEnv, secrets, "runtime command", commandForDebug(command, manifest, secrets));
     info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
     const spawner = options.spawnSync || spawnSync;
     result = spawner(command[0], command.slice(1), {
@@ -70,8 +72,8 @@ async function runAgent(manifest, options = {}) {
       encoding: "utf8",
       maxBuffer: 20 * 1024 * 1024,
     });
-    recordDebug(debugLines, baseEnv, secrets, "runtime result", runtimeResultSummary(result));
-    recordDebug(debugLines, baseEnv, secrets, "runtime output tail", {
+    recordDebug(debugLines, debugEnv, secrets, "runtime result", runtimeResultSummary(result));
+    recordDebug(debugLines, debugEnv, secrets, "runtime output tail", {
       stdout_tail: sanitizeText(tail(result.stdout || "", 4000), secrets),
       stderr_tail: sanitizeText(tail(result.stderr || "", 4000), secrets),
     });
@@ -84,7 +86,7 @@ async function runAgent(manifest, options = {}) {
       } catch (error) {
         draftParseError = error instanceof Error ? error.message : String(error);
         runError = error;
-        recordDebug(debugLines, baseEnv, secrets, "graph update draft parse error", draftParseError);
+        recordDebug(debugLines, debugEnv, secrets, "graph update draft parse error", draftParseError);
       }
     }
 
@@ -105,7 +107,7 @@ async function runAgent(manifest, options = {}) {
     runError = error;
     recordDebug(
       debugLines,
-      baseEnv,
+      debugEnv,
       secrets,
       "run error",
       error instanceof Error ? error.message : String(error),
@@ -174,6 +176,16 @@ async function runAgent(manifest, options = {}) {
   };
 }
 
+function debugModeEnvironment(env, manifest) {
+  if (isDebugMode(env) || manifest.debug_mode_enabled !== true) {
+    return env;
+  }
+  return {
+    ...env,
+    LABOR0_AGENT_DEBUG: "true",
+  };
+}
+
 function agentEnvironment(manifest, baseEnv = process.env) {
   return {
     ...baseEnv,
@@ -229,7 +241,8 @@ async function runPlanModeGate(manifest, options = {}) {
   const relay = options.planModeRelay || (await createPlanModeRelay(planMode, manifest, options));
   await relay.sessionState("active", "Plan phase started.");
   const planCommand = runtimePlanCommand(manifest, { env: options.baseEnv || process.env });
-  recordDebug(options.debugLines, options.baseEnv || process.env, options.secrets, "plan command", commandForDebug(planCommand, manifest, options.secrets));
+  const debugEnv = options.debugEnv || options.baseEnv || process.env;
+  recordDebug(options.debugLines, debugEnv, options.secrets, "plan command", commandForDebug(planCommand, manifest, options.secrets));
   info(`Running ${manifest.agent_runtime_type || "agent"} plan phase`);
 
   const planRunner = options.runPlanCommand || runCommandStreaming;
@@ -239,8 +252,8 @@ async function runPlanModeGate(manifest, options = {}) {
     onStdout: (data) => relay.output(data, false),
     onStderr: (data) => relay.output(data, true),
   });
-  recordDebug(options.debugLines, options.baseEnv || process.env, options.secrets, "plan result", runtimeResultSummary(result));
-  recordDebug(options.debugLines, options.baseEnv || process.env, options.secrets, "plan output tail", {
+  recordDebug(options.debugLines, debugEnv, options.secrets, "plan result", runtimeResultSummary(result));
+  recordDebug(options.debugLines, debugEnv, options.secrets, "plan output tail", {
     stdout_tail: sanitizeText(tail(result.stdout || "", 4000), options.secrets),
     stderr_tail: sanitizeText(tail(result.stderr || "", 4000), options.secrets),
   });
@@ -1285,6 +1298,7 @@ function manifestDebugSummary(manifest) {
     agent_task_purpose: manifest.agent_task_purpose || "",
     agent_runtime_type: manifest.agent_runtime_type || "",
     agent_model: manifest.agent_model || "",
+    debug_mode_enabled: manifest.debug_mode_enabled === true,
     prompt_bytes: byteLength(manifest.prompt || ""),
     graph_update_context: graphUpdateContextDebugSummary(manifest.graph_update_context),
     repository_count: Array.isArray(manifest.repositories) ? manifest.repositories.length : 0,
