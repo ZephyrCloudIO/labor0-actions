@@ -36,6 +36,7 @@ async function runAgent(manifest, options = {}) {
   let planModeDecision = "not_required";
   let planModeRequestID = "";
   let planResult = null;
+  let branchSnapshot = {};
   const startedAt = new Date();
 
   try {
@@ -62,7 +63,12 @@ async function runAgent(manifest, options = {}) {
       planModeRequestID = planGate.ttyRequestId || "";
       planResult = planGate.result || null;
     }
-    command = runtimeCommand(manifest, { env: baseEnv });
+    if (manifest.agent_task_purpose === "coding") {
+      const branchSnapshotter = options.snapshotRepositoryBranches || snapshotRepositoryBranches;
+      branchSnapshot = branchSnapshotter(manifest, { cwd, env: baseEnv });
+      recordDebug(debugLines, debugEnv, secrets, "local branch snapshot", branchSnapshotDebugSummary(branchSnapshot));
+    }
+    command = runtimeCommand(manifest, { cwd, env: baseEnv });
     recordDebug(debugLines, debugEnv, secrets, "runtime command", commandForDebug(command, manifest, secrets));
     info(`Running ${manifest.agent_runtime_type || "agent"} for ${manifest.agent_task_purpose || "task"}`);
     const spawner = options.spawnSync || spawnSync;
@@ -91,8 +97,11 @@ async function runAgent(manifest, options = {}) {
     }
 
     if (!runError && result.status === 0 && manifest.agent_task_purpose === "coding") {
-      const pullRequestCreator = options.createPullRequestsForChangedRepositories || createPullRequestsForChangedRepositories;
-      pullRequests = pullRequestCreator(manifest);
+      const pullRequestDetector =
+        options.detectPullRequestsForChangedBranches ||
+        options.createPullRequestsForChangedRepositories ||
+        detectPullRequestsForChangedBranches;
+      pullRequests = pullRequestDetector(manifest, branchSnapshot, { cwd, env: baseEnv });
       if (pullRequests.length > 0) {
         writeJSON(pullRequestsPath, pullRequests);
         emitOutput("pull_requests_path", pullRequestsPath);
@@ -1027,6 +1036,9 @@ function graphUpdateTaskRefSchema(allowDraftRef) {
 }
 
 function runtimePrompt(manifest) {
+  if (manifest.agent_task_purpose === "coding") {
+    return codingRuntimePrompt(manifest);
+  }
   if (manifest.agent_task_purpose !== "graph_update") {
     return manifest.prompt || "";
   }
@@ -1071,6 +1083,52 @@ Use graph_agent_task_id for existing tasks from the current graph context and dr
 Do not use predecessor_task_id or successor_task_id in draft payloads; those names appear only in the current graph context.
 Use quoted strings or block scalars for free-text YAML fields such as summary, title, and description. Prefer block scalars when the text contains punctuation such as ": ".
 Do not wrap the YAML in Markdown.`;
+}
+
+function codingRuntimePrompt(manifest) {
+  const instructions = codingPullRequestInstructions(manifest);
+  if (!instructions) {
+    return manifest.prompt || "";
+  }
+  return `${manifest.prompt || ""}
+
+${instructions}`;
+}
+
+function codingPullRequestInstructions(manifest) {
+  const repositories = Array.isArray(manifest && manifest.repositories) ? manifest.repositories : [];
+  const writableRepositories = repositories.filter((repository) => repository && repository.access_mode === "read_write");
+  if (writableRepositories.length === 0) {
+    return "";
+  }
+  const lines = [
+    "Labor0 pull request policy:",
+    "- You, the coding agent, own any required commits, pushes, and pull request creation.",
+    "- The GitHub Actions runner will not create commits, push branches, or open pull requests for you.",
+    "- The runner discovers pull requests only by comparing local branch names before and after implementation, so leave any PR branch as a local branch in its checkout.",
+    "- Use the GitHub CLI when creating or inspecting GitHub pull requests.",
+    "- Pull request bodies must include a concise change summary and the tests or validation performed.",
+  ];
+  for (const repository of writableRepositories) {
+    const checkoutPath = repository.checkout_path || `repositories/${repository.repository_id}`;
+    const update = existingPullRequestUpdate(repository);
+    lines.push(
+      `- Repository ${repository.repository_id || repository.git_url} at ${checkoutPath}: ${repositoryPullRequestInstruction(repository, update)}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function repositoryPullRequestInstruction(repository, update) {
+  if (update) {
+    const branchName = normalizeRef(update.branch_name || update.branch || repository.selected_ref);
+    const target = update.pull_request_ref || update.pull_request_url || branchName;
+    return `update existing pull request ${target} by committing and pushing to branch ${branchName}; do not create or report a new pull request.`;
+  }
+  if (repository.auto_pull_request_enabled === false) {
+    return "automatic pull requests are disabled; do not create a pull request and do not create a PR branch.";
+  }
+  return "automatic pull requests are enabled; create a new local branch, commit changes, push it, and open a pull request.";
 }
 
 function shellCommand(command) {
@@ -1411,37 +1469,112 @@ function sanitizeText(value, secrets) {
   return output;
 }
 
-function createPullRequestsForChangedRepositories(manifest) {
-  const pullRequests = [];
+function snapshotRepositoryBranches(manifest, options = {}) {
+  const snapshot = {};
   for (const repository of manifest.repositories || []) {
-    if (!shouldPublishRepositoryChanges(repository)) {
+    const key = repositorySnapshotKey(repository);
+    if (!key) {
       continue;
     }
-    const checkoutPath = path.resolve(
-      process.env.GITHUB_WORKSPACE || process.cwd(),
-      repository.checkout_path || `repositories/${repository.repository_id}`,
-    );
-    if (!fs.existsSync(checkoutPath) || !hasChanges(checkoutPath)) {
+    const checkoutPath = repositoryCheckoutPath(repository, options);
+    if (!fs.existsSync(checkoutPath)) {
+      snapshot[key] = [];
       continue;
     }
-    if (shouldUpdateExistingPullRequest(repository)) {
-      pushExistingPullRequestUpdate(manifest, repository, checkoutPath);
+    snapshot[key] = listLocalBranches(checkoutPath);
+  }
+  return snapshot;
+}
+
+function branchSnapshotDebugSummary(snapshot) {
+  const summary = {};
+  for (const [key, branches] of Object.entries(snapshot || {})) {
+    summary[key] = Array.isArray(branches) ? branches.length : 0;
+  }
+  return summary;
+}
+
+function detectPullRequestsForChangedBranches(manifest, beforeSnapshot = {}, options = {}) {
+  const pullRequests = [];
+  const violations = [];
+  for (const repository of manifest.repositories || []) {
+    const checkoutPath = repositoryCheckoutPath(repository, options);
+    if (!fs.existsSync(checkoutPath)) {
       continue;
     }
-    pullRequests.push(createPullRequest(manifest, repository, checkoutPath));
+    const before = new Set(beforeSnapshot[repositorySnapshotKey(repository)] || []);
+    const newBranches = listLocalBranches(checkoutPath).filter((branch) => !before.has(branch));
+    if (newBranches.length === 0) {
+      continue;
+    }
+    const env = githubEnvironment(repository, options.env || process.env);
+    for (const branchName of newBranches.sort()) {
+      const pr = viewPullRequest(branchName, checkoutPath, env);
+      if (!pr) {
+        info(`No pull request found for new local branch ${branchName} in repository ${repository.repository_id}`);
+        continue;
+      }
+      if (!shouldReportNewPullRequest(repository)) {
+        violations.push(
+          `${repository.repository_id || repository.git_url} branch ${branchName}: ${pullRequestReportingDenialReason(repository)}`,
+        );
+        continue;
+      }
+      const ref = parseGitHubRepository(repository.git_url);
+      if (!ref) {
+        throw new Error(`Cannot report pull request for non-GitHub repository ${repository.git_url}`);
+      }
+      pullRequests.push({
+        repository_id: repository.repository_id,
+        git_url: repository.git_url,
+        branch_name: branchName,
+        pull_request_ref: `github:${ref.owner}/${ref.repo}#${pr.number}`,
+        pull_request_number: pr.number,
+        pull_request_url: pr.url,
+        is_open: pr.state ? String(pr.state).toUpperCase() === "OPEN" : true,
+        ...(pr.mergedAt ? { merged_at: pr.mergedAt } : {}),
+      });
+    }
+  }
+  if (violations.length > 0) {
+    throw new Error(`Detected pull request(s) that violate the Labor0 repository policy: ${violations.join("; ")}`);
   }
   return pullRequests;
 }
 
-function shouldPublishRepositoryChanges(repository) {
-  return shouldUpdateExistingPullRequest(repository) || shouldCreatePullRequest(repository);
+function repositoryCheckoutPath(repository, options = {}) {
+  return path.resolve(
+    runnerWorkspace(options),
+    repository.checkout_path || `repositories/${repository.repository_id}`,
+  );
+}
+
+function repositorySnapshotKey(repository) {
+  return String((repository && (repository.repository_id || repository.checkout_path || repository.git_url)) || "").trim();
+}
+
+function listLocalBranches(cwd) {
+  const result = run("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { cwd, capture: true });
+  return result.stdout
+    .split(/\r?\n/)
+    .map((branch) => branch.trim())
+    .filter(Boolean)
+    .sort();
+}
+
+function githubEnvironment(repository, baseEnv = process.env) {
+  const token = repository.token || repository.access_token || (repository.credential && repository.credential.token);
+  return {
+    ...baseEnv,
+    ...(token ? { GH_TOKEN: token, GITHUB_TOKEN: token } : {}),
+  };
 }
 
 function shouldUpdateExistingPullRequest(repository) {
   return repository.access_mode === "read_write" && Boolean(existingPullRequestUpdate(repository));
 }
 
-function shouldCreatePullRequest(repository) {
+function shouldReportNewPullRequest(repository) {
   return (
     repository.access_mode === "read_write" &&
     !existingPullRequestUpdate(repository) &&
@@ -1449,60 +1582,17 @@ function shouldCreatePullRequest(repository) {
   );
 }
 
-function hasChanges(cwd) {
-  const result = run("git", ["status", "--porcelain"], { cwd, capture: true });
-  return result.stdout.trim().length > 0;
-}
-
-function createPullRequest(manifest, repository, cwd) {
-  const ref = parseGitHubRepository(repository.git_url);
-  if (!ref) {
-    throw new Error(`Cannot open pull request for non-GitHub repository ${repository.git_url}`);
+function pullRequestReportingDenialReason(repository) {
+  if (repository.access_mode !== "read_write") {
+    return `repository access_mode is ${repository.access_mode || "unset"}`;
   }
-  const token = repository.token || repository.access_token || (repository.credential && repository.credential.token);
-  const branchName = `labor0/${shortID(manifest.agent_task_session_id)}/${shortID(repository.repository_id)}`;
-  const baseBranch = normalizeRef(repository.selected_ref);
-  const title = `chore: apply ${manifest.task_title || "Labor0 agent task"}`;
-  const body = [
-    `Labor0 agent task: ${manifest.agent_task_id}`,
-    `Session: ${manifest.agent_task_session_id}`,
-    `Runtime: ${manifest.agent_runtime_type}${manifest.agent_model ? ` (${manifest.agent_model})` : ""}`,
-  ].join("\n");
-  const env = { ...process.env, ...(token ? { GH_TOKEN: token, GITHUB_TOKEN: token } : {}) };
-
-  run("git", ["config", "user.name", "labor0-agent"], { cwd });
-  run("git", ["config", "user.email", "agent@labor0.com"], { cwd });
-  run("git", ["checkout", "-B", branchName], { cwd });
-  run("git", ["add", "-A"], { cwd });
-  run("git", ["commit", "-m", title], { cwd });
-  run("git", ["push", "-u", "origin", `HEAD:${branchName}`], { cwd });
-
-  const existing = viewPullRequest(branchName, cwd, env);
-  const pr = existing || createGitHubPullRequest(branchName, baseBranch, title, body, cwd, env);
-  return {
-    repository_id: repository.repository_id,
-    git_url: repository.git_url,
-    branch_name: branchName,
-    pull_request_ref: `github:${ref.owner}/${ref.repo}#${pr.number}`,
-    pull_request_number: pr.number,
-    pull_request_url: pr.url,
-    is_open: true,
-  };
-}
-
-function pushExistingPullRequestUpdate(manifest, repository, cwd) {
-  const update = existingPullRequestUpdate(repository);
-  const branchName = normalizeRef(update.branch_name || update.branch || repository.selected_ref);
-  if (!branchName) {
-    throw new Error(`Cannot update existing pull request for repository ${repository.repository_id}: missing branch_name`);
+  if (existingPullRequestUpdate(repository)) {
+    return "repository is configured to update an existing pull request";
   }
-  const title = `chore: apply ${manifest.task_title || "Labor0 agent task"}`;
-  run("git", ["config", "user.name", "labor0-agent"], { cwd });
-  run("git", ["config", "user.email", "agent@labor0.com"], { cwd });
-  run("git", ["add", "-A"], { cwd });
-  run("git", ["commit", "-m", title], { cwd });
-  run("git", ["push", "origin", `HEAD:${branchName}`], { cwd });
-  info(`Pushed changes to existing pull request ${update.pull_request_ref || branchName}`);
+  if (repository.auto_pull_request_enabled === false) {
+    return "auto_pull_request_enabled is false";
+  }
+  return "new pull request reporting is disabled by repository policy";
 }
 
 function existingPullRequestUpdate(repository) {
@@ -1526,7 +1616,7 @@ function pullRequestUpdateDebugSummary(update) {
 }
 
 function viewPullRequest(branchName, cwd, env) {
-  const result = spawnSync("gh", ["pr", "view", branchName, "--json", "number,url"], {
+  const result = spawnSync("gh", ["pr", "view", branchName, "--json", "number,url,state,mergedAt"], {
     cwd,
     env,
     encoding: "utf8",
@@ -1537,21 +1627,6 @@ function viewPullRequest(branchName, cwd, env) {
   return JSON.parse(result.stdout);
 }
 
-function createGitHubPullRequest(branchName, baseBranch, title, body, cwd, env) {
-  const create = run(
-    "gh",
-    ["pr", "create", "--title", title, "--body", body, "--base", baseBranch, "--head", branchName],
-    { cwd, env, capture: true },
-  );
-  const url = create.stdout.trim().split(/\s+/).find((item) => /^https?:\/\//.test(item)) || "";
-  const view = run("gh", ["pr", "view", url || branchName, "--json", "number,url"], {
-    cwd,
-    env,
-    capture: true,
-  });
-  return JSON.parse(view.stdout);
-}
-
 function parseGitHubRepository(gitURL) {
   const match = String(gitURL || "").match(/^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
   return match ? { owner: match[1], repo: match[2] } : null;
@@ -1559,10 +1634,6 @@ function parseGitHubRepository(gitURL) {
 
 function normalizeRef(ref) {
   return (ref || "main").replace(/^refs\/heads\//, "").replace(/^refs\/tags\//, "");
-}
-
-function shortID(value) {
-  return String(value || "task").replace(/[^a-zA-Z0-9]/g, "").slice(0, 12) || "task";
 }
 
 function run(command, args, options = {}) {
@@ -1598,7 +1669,7 @@ if (require.main === module) {
 
 module.exports = {
   agentEnvironment,
-  createPullRequestsForChangedRepositories,
+  detectPullRequestsForChangedBranches,
   extractJSONObject,
   graphUpdateDraftSchema,
   graphUpdateDraftFromOutput,
@@ -1614,8 +1685,9 @@ module.exports = {
   runtimePlanCommand,
   runAgent,
   sanitizeText,
-  shouldCreatePullRequest,
+  shouldReportNewPullRequest,
   shouldUpdateExistingPullRequest,
+  snapshotRepositoryBranches,
   synthesizeOpenCodeConfig,
   validateRuntimeAuth,
 };

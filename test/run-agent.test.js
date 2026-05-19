@@ -7,7 +7,7 @@ const path = require("node:path");
 const test = require("node:test");
 const { isDebugMode } = require("../actions/lib/core");
 const {
-  createPullRequestsForChangedRepositories,
+  detectPullRequestsForChangedBranches,
   graphUpdateDraftFromOutput,
   graphUpdateDraftSchema,
   planApprovalDecisionFromTranscript,
@@ -18,7 +18,7 @@ const {
   runtimeCommand,
   runtimePlanCommand,
   runAgent,
-  shouldCreatePullRequest,
+  shouldReportNewPullRequest,
   shouldUpdateExistingPullRequest,
   synthesizeOpenCodeConfig,
   validateRuntimeAuth,
@@ -850,7 +850,7 @@ test("debug diagnostics honor manifest debug flag without runner environment", a
     env: { RUNNER_TEMP: tempDir },
     installRuntime: () => {},
     prepareRuntimeAuthentication: () => {},
-    createPullRequestsForChangedRepositories: () => [],
+    detectPullRequestsForChangedBranches: () => [],
     setOutput: (name, value) => {
       outputs[name] = value;
     },
@@ -893,7 +893,7 @@ test("plan approval streams output and continues implementation", async () => {
     env: { OPENAI_API_KEY: "sk-test", RUNNER_TEMP: tempDir },
     installRuntime: () => {},
     prepareRuntimeAuthentication: () => {},
-    createPullRequestsForChangedRepositories: () => [],
+    detectPullRequestsForChangedBranches: () => [],
     setOutput: (name, value) => {
       outputs[name] = value;
     },
@@ -1031,15 +1031,15 @@ test("plan approval parser recognizes approved and rejected transcript status", 
   );
 });
 
-test("pull request creation defaults on for read-write repositories only", () => {
-  assert.equal(shouldCreatePullRequest({ access_mode: "read_write" }), true);
+test("pull request reporting defaults on for read-write auto-PR repositories only", () => {
+  assert.equal(shouldReportNewPullRequest({ access_mode: "read_write" }), true);
   assert.equal(
-    shouldCreatePullRequest({ access_mode: "read_write", auto_pull_request_enabled: false }),
+    shouldReportNewPullRequest({ access_mode: "read_write", auto_pull_request_enabled: false }),
     false,
   );
-  assert.equal(shouldCreatePullRequest({ access_mode: "read_only" }), false);
+  assert.equal(shouldReportNewPullRequest({ access_mode: "read_only" }), false);
   assert.equal(
-    shouldCreatePullRequest({
+    shouldReportNewPullRequest({
       access_mode: "read_write",
       pull_request_update: { branch_name: "feature/review-fix" },
     }),
@@ -1055,7 +1055,199 @@ test("pull request creation defaults on for read-write repositories only", () =>
   );
 });
 
-test("existing pull request update pushes target branch without reporting a new pull request", () => {
+test("coding prompt delegates pull request creation to the agent with repository policy", () => {
+  const command = runtimeCommand({
+    agent_runtime_type: "codex",
+    agent_task_purpose: "coding",
+    agent_model: "gpt-5.4",
+    prompt: "Implement runtime auth",
+    repositories: [
+      {
+        repository_id: "0199e7be-9000-7000-8000-000000000003",
+        git_url: "https://github.com/example/repo.git",
+        checkout_path: "repo-a",
+        selected_ref: "refs/heads/main",
+        access_mode: "read_write",
+        auto_pull_request_enabled: true,
+      },
+      {
+        repository_id: "0199e7be-9000-7000-8000-000000000004",
+        git_url: "https://github.com/example/no-pr.git",
+        checkout_path: "repo-b",
+        selected_ref: "refs/heads/main",
+        access_mode: "read_write",
+        auto_pull_request_enabled: false,
+      },
+      {
+        repository_id: "0199e7be-9000-7000-8000-000000000005",
+        git_url: "https://github.com/example/update-pr.git",
+        checkout_path: "repo-c",
+        selected_ref: "refs/heads/feature/review-fix",
+        access_mode: "read_write",
+        auto_pull_request_enabled: false,
+        pull_request_update: {
+          pull_request_ref: "github:example/update-pr#12",
+          branch_name: "feature/review-fix",
+        },
+      },
+    ],
+  });
+  const prompt = command.at(-1);
+
+  assert.match(prompt, /You, the coding agent, own any required commits, pushes, and pull request creation/);
+  assert.match(prompt, /runner will not create commits, push branches, or open pull requests/);
+  assert.match(prompt, /create a new local branch, commit changes, push it, and open a pull request/);
+  assert.match(prompt, /automatic pull requests are disabled; do not create a pull request/);
+  assert.match(prompt, /update existing pull request github:example\/update-pr#12/);
+  assert.match(prompt, /Pull request bodies must include a concise change summary and the tests or validation performed/);
+});
+
+test("pull request detection reports PRs created by the agent from new local branches", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-detect-pr-test-"));
+  const checkoutPath = path.join(tempDir, "repo");
+  const binPath = path.join(tempDir, "bin");
+  const logPath = path.join(tempDir, "commands.jsonl");
+  fs.mkdirSync(checkoutPath, { recursive: true });
+  fs.mkdirSync(binPath, { recursive: true });
+  writeExecutable(
+    path.join(binPath, "git"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LABOR0_TEST_COMMAND_LOG, JSON.stringify({ command: "git", args }) + "\\n");
+if (args[0] === "for-each-ref") {
+  process.stdout.write("main\\nlabor0/agent-created\\n");
+}
+process.exit(0);
+`,
+  );
+  writeExecutable(
+    path.join(binPath, "gh"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LABOR0_TEST_COMMAND_LOG, JSON.stringify({ command: "gh", args, token: process.env.GH_TOKEN || "" }) + "\\n");
+if (args[0] === "pr" && args[1] === "view" && args[2] === "labor0/agent-created") {
+  process.stdout.write(JSON.stringify({ number: 42, url: "https://github.com/example/repo/pull/42", state: "OPEN", mergedAt: null }));
+  process.exit(0);
+}
+process.exit(1);
+`,
+  );
+
+  let pullRequests = [];
+  withEnv(
+    {
+      GITHUB_WORKSPACE: tempDir,
+      LABOR0_TEST_COMMAND_LOG: logPath,
+      PATH: `${binPath}${path.delimiter}${process.env.PATH || ""}`,
+    },
+    () => {
+      pullRequests = detectPullRequestsForChangedBranches(
+        {
+          repositories: [
+            {
+              repository_id: "0199e7be-9000-7000-8000-000000000003",
+              git_url: "https://github.com/example/repo.git",
+              checkout_path: "repo",
+              access_mode: "read_write",
+              auto_pull_request_enabled: true,
+              credential: { token: "ghs-test-token" },
+            },
+          ],
+        },
+        {
+          "0199e7be-9000-7000-8000-000000000003": ["main"],
+        },
+      );
+    },
+  );
+
+  assert.deepEqual(pullRequests, [
+    {
+      repository_id: "0199e7be-9000-7000-8000-000000000003",
+      git_url: "https://github.com/example/repo.git",
+      branch_name: "labor0/agent-created",
+      pull_request_ref: "github:example/repo#42",
+      pull_request_number: 42,
+      pull_request_url: "https://github.com/example/repo/pull/42",
+      is_open: true,
+    },
+  ]);
+  const commands = fs
+    .readFileSync(logPath, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(commands.map((command) => command.command), ["git", "gh"]);
+  assert.equal(commands[1].token, "ghs-test-token");
+});
+
+test("pull request detection fails when disabled repositories create PRs", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-disabled-pr-test-"));
+  const checkoutPath = path.join(tempDir, "repo");
+  const binPath = path.join(tempDir, "bin");
+  const logPath = path.join(tempDir, "commands.jsonl");
+  fs.mkdirSync(checkoutPath, { recursive: true });
+  fs.mkdirSync(binPath, { recursive: true });
+  writeExecutable(
+    path.join(binPath, "git"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LABOR0_TEST_COMMAND_LOG, JSON.stringify({ command: "git", args }) + "\\n");
+if (args[0] === "for-each-ref") {
+  process.stdout.write("main\\nlabor0/disabled-pr\\n");
+}
+process.exit(0);
+`,
+  );
+  writeExecutable(
+    path.join(binPath, "gh"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LABOR0_TEST_COMMAND_LOG, JSON.stringify({ command: "gh", args }) + "\\n");
+if (args[0] === "pr" && args[1] === "view") {
+  process.stdout.write(JSON.stringify({ number: 9, url: "https://github.com/example/no-pr/pull/9", state: "OPEN", mergedAt: null }));
+  process.exit(0);
+}
+process.exit(1);
+`,
+  );
+
+  withEnv(
+    {
+      GITHUB_WORKSPACE: tempDir,
+      LABOR0_TEST_COMMAND_LOG: logPath,
+      PATH: `${binPath}${path.delimiter}${process.env.PATH || ""}`,
+    },
+    () => {
+      assert.throws(
+        () =>
+          detectPullRequestsForChangedBranches(
+            {
+              repositories: [
+                {
+                  repository_id: "0199e7be-9000-7000-8000-000000000004",
+                  git_url: "https://github.com/example/no-pr.git",
+                  checkout_path: "repo",
+                  access_mode: "read_write",
+                  auto_pull_request_enabled: false,
+                },
+              ],
+            },
+            {
+              "0199e7be-9000-7000-8000-000000000004": ["main"],
+            },
+          ),
+        /auto_pull_request_enabled is false/,
+      );
+    },
+  );
+});
+
+test("existing pull request update does not report a new pull request when no new branch appears", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-existing-pr-test-"));
   const checkoutPath = path.join(tempDir, "repo");
   const binPath = path.join(tempDir, "bin");
@@ -1068,8 +1260,8 @@ test("existing pull request update pushes target branch without reporting a new 
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.LABOR0_TEST_COMMAND_LOG, JSON.stringify({ command: "git", args }) + "\\n");
-if (args[0] === "status") {
-  process.stdout.write(" M file.js\\n");
+if (args[0] === "for-each-ref") {
+  process.stdout.write("feature/review-fix\\n");
 }
 process.exit(0);
 `,
@@ -1090,28 +1282,29 @@ process.exit(1);
       PATH: `${binPath}${path.delimiter}${process.env.PATH || ""}`,
     },
     () => {
-      const pullRequests = createPullRequestsForChangedRepositories({
-        agent_task_session_id: "0199e7be-9000-7000-8000-000000000001",
-        agent_task_id: "0199e7be-9000-7000-8000-000000000010",
-        agent_runtime_type: "codex",
-        task_title: "review feedback",
-        repositories: [
-          {
-            repository_id: "0199e7be-9000-7000-8000-000000000003",
-            git_url: "https://github.com/example/repo.git",
-            checkout_path: "repo",
-            selected_ref: "refs/heads/feature/review-fix",
-            access_mode: "read_write",
-            auto_pull_request_enabled: false,
-            pull_request_update: {
-              pull_request_ref: "github:example/repo#12",
-              pull_request_number: 12,
-              pull_request_url: "https://github.com/example/repo/pull/12",
-              branch_name: "feature/review-fix",
+      const pullRequests = detectPullRequestsForChangedBranches(
+        {
+          repositories: [
+            {
+              repository_id: "0199e7be-9000-7000-8000-000000000003",
+              git_url: "https://github.com/example/repo.git",
+              checkout_path: "repo",
+              selected_ref: "refs/heads/feature/review-fix",
+              access_mode: "read_write",
+              auto_pull_request_enabled: false,
+              pull_request_update: {
+                pull_request_ref: "github:example/repo#12",
+                pull_request_number: 12,
+                pull_request_url: "https://github.com/example/repo/pull/12",
+                branch_name: "feature/review-fix",
+              },
             },
-          },
-        ],
-      });
+          ],
+        },
+        {
+          "0199e7be-9000-7000-8000-000000000003": ["feature/review-fix"],
+        },
+      );
 
       assert.deepEqual(pullRequests, []);
     },
@@ -1122,11 +1315,8 @@ process.exit(1);
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
-  assert.deepEqual(commands.map((command) => command.command), ["git", "git", "git", "git", "git", "git"]);
-  assert.deepEqual(commands.at(-1), {
-    command: "git",
-    args: ["push", "origin", "HEAD:feature/review-fix"],
-  });
+  assert.deepEqual(commands.map((command) => command.command), ["git"]);
+  assert.deepEqual(commands[0].args, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
   assert.equal(commands.some((command) => command.command === "gh"), false);
 });
 
