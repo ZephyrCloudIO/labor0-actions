@@ -177,6 +177,29 @@ test("agent environment exports GitHub CLI tokens for PR-capable repositories", 
   );
 });
 
+test("agent environment prefers repository token over ambient GITHUB_TOKEN for gh auth", () => {
+  const env = agentEnvironment(
+    codingManifest({
+      repositories: [
+        {
+          repository_id: "0199e7be-9000-7000-8000-000000000003",
+          git_url: "https://github.com/example/repo.git",
+          checkout_path: "repo-a",
+          access_mode: "read_write",
+          auto_pull_request_enabled: true,
+          credential: { token: "ghs-pr-token" },
+        },
+      ],
+    }),
+    {
+      GITHUB_TOKEN: "ghs-wrapper-token",
+    },
+  );
+
+  assert.equal(env.GH_TOKEN, "ghs-pr-token");
+  assert.equal(env.GITHUB_TOKEN, "ghs-wrapper-token");
+});
+
 test("plan mode commands use runtime-specific read-only planning", () => {
   assert.deepEqual(
     runtimePlanCommand({
@@ -1149,7 +1172,7 @@ test("coding prompt delegates pull request creation to the agent with repository
   assert.match(prompt, /create a new local branch, commit changes, push it, and open a pull request/);
   assert.match(prompt, /automatic pull requests are disabled; do not create a pull request/);
   assert.match(prompt, /update existing pull request github:example\/update-pr#12/);
-  assert.match(prompt, /The runner exports GH_TOKEN and GITHUB_TOKEN/);
+  assert.match(prompt, /The runner exports GH_TOKEN from a writable repository token/);
   assert.match(prompt, /Pull request bodies must include a concise change summary and the tests or validation performed/);
 });
 

@@ -458,8 +458,8 @@ function githubCLIEnvironment(manifest, currentEnv = process.env) {
   if (tokenEntries.length === 0) {
     return {};
   }
-  const existingToken = String(currentEnv.GH_TOKEN || currentEnv.GITHUB_TOKEN || "").trim();
-  const defaultToken = existingToken || tokenEntries[0].token;
+  const explicitGhToken = String(currentEnv.GH_TOKEN || "").trim();
+  const defaultToken = explicitGhToken || tokenEntries[0].token;
   const env = {
     LABOR0_GITHUB_TOKENS_JSON: JSON.stringify(tokenEntries),
   };
@@ -1405,7 +1405,7 @@ function codingPullRequestInstructions(manifest) {
     "- The GitHub Actions runner will not create commits, push branches, or open pull requests for you.",
     "- The runner discovers pull requests only by comparing local branch names before and after implementation, so leave any PR branch as a local branch in its checkout.",
     "- Use the GitHub CLI when creating or inspecting GitHub pull requests.",
-    "- The runner exports GH_TOKEN and GITHUB_TOKEN when a writable repository token is available; use LABOR0_GITHUB_TOKENS_JSON for repository-specific GitHub tokens when working across multiple repositories.",
+    "- The runner exports GH_TOKEN from a writable repository token when available; use LABOR0_GITHUB_TOKENS_JSON for repository-specific GitHub tokens when working across multiple repositories.",
     "- Pull request bodies must include a concise change summary and the tests or validation performed.",
   ];
   for (const repository of writableRepositories) {
