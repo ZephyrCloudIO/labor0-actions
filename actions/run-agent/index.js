@@ -196,9 +196,13 @@ function debugModeEnvironment(env, manifest) {
 }
 
 function agentEnvironment(manifest, baseEnv = process.env) {
-  return {
+  const runtimeEnv = {
     ...baseEnv,
     ...(manifest.agent_runtime_environment || {}),
+  };
+  return {
+    ...runtimeEnv,
+    ...githubCLIEnvironment(manifest, runtimeEnv),
     LABOR0_AGENT_TASK_SESSION_ID: manifest.agent_task_session_id,
     LABOR0_AGENT_TASK_ID: manifest.agent_task_id,
     LABOR0_GRAPH_AGENT_TASK_ID: manifest.graph_agent_task_id,
@@ -207,6 +211,60 @@ function agentEnvironment(manifest, baseEnv = process.env) {
     LABOR0_AGENT_MODEL: manifest.agent_model || "",
     LABOR0_AGENT_PROMPT: manifest.prompt || "",
   };
+}
+
+function githubCLIEnvironment(manifest, currentEnv = process.env) {
+  const tokenEntries = gitHubTokenEntriesForAgent(manifest);
+  if (tokenEntries.length === 0) {
+    return {};
+  }
+  const existingToken = String(currentEnv.GH_TOKEN || currentEnv.GITHUB_TOKEN || "").trim();
+  const defaultToken = existingToken || tokenEntries[0].token;
+  const env = {
+    LABOR0_GITHUB_TOKENS_JSON: JSON.stringify(tokenEntries),
+  };
+  if (!has(currentEnv, "GH_TOKEN")) {
+    env.GH_TOKEN = defaultToken;
+  }
+  if (!has(currentEnv, "GITHUB_TOKEN")) {
+    env.GITHUB_TOKEN = defaultToken;
+  }
+  return env;
+}
+
+function gitHubTokenEntriesForAgent(manifest) {
+  const entries = [];
+  for (const repository of manifest.repositories || []) {
+    if (!shouldExposeGitHubTokenToAgent(repository)) {
+      continue;
+    }
+    const token = repositoryGitHubToken(repository);
+    if (!token) {
+      continue;
+    }
+    entries.push({
+      repository_id: repository.repository_id || "",
+      git_url: repository.git_url || "",
+      checkout_path: repository.checkout_path || `repositories/${repository.repository_id}`,
+      token,
+    });
+  }
+  return entries;
+}
+
+function shouldExposeGitHubTokenToAgent(repository) {
+  return (
+    repository &&
+    repository.access_mode === "read_write" &&
+    (repository.auto_pull_request_enabled !== false || Boolean(existingPullRequestUpdate(repository)))
+  );
+}
+
+function repositoryGitHubToken(repository) {
+  return String(
+    (repository && (repository.token || repository.access_token || (repository.credential && repository.credential.token))) ||
+      "",
+  ).trim();
 }
 
 function installRuntime(runtimeType) {
@@ -1107,6 +1165,7 @@ function codingPullRequestInstructions(manifest) {
     "- The GitHub Actions runner will not create commits, push branches, or open pull requests for you.",
     "- The runner discovers pull requests only by comparing local branch names before and after implementation, so leave any PR branch as a local branch in its checkout.",
     "- Use the GitHub CLI when creating or inspecting GitHub pull requests.",
+    "- The runner exports GH_TOKEN and GITHUB_TOKEN when a writable repository token is available; use LABOR0_GITHUB_TOKENS_JSON for repository-specific GitHub tokens when working across multiple repositories.",
     "- Pull request bodies must include a concise change summary and the tests or validation performed.",
   ];
   for (const repository of writableRepositories) {
@@ -1514,6 +1573,10 @@ function detectPullRequestsForChangedBranches(manifest, beforeSnapshot = {}, opt
         info(`No pull request found for new local branch ${branchName} in repository ${repository.repository_id}`);
         continue;
       }
+      if (isExistingPullRequestUpdateBranch(repository, branchName, pr)) {
+        info(`Detected existing pull request update branch ${branchName} in repository ${repository.repository_id}`);
+        continue;
+      }
       if (!shouldReportNewPullRequest(repository)) {
         violations.push(
           `${repository.repository_id || repository.git_url} branch ${branchName}: ${pullRequestReportingDenialReason(repository)}`,
@@ -1563,11 +1626,26 @@ function listLocalBranches(cwd) {
 }
 
 function githubEnvironment(repository, baseEnv = process.env) {
-  const token = repository.token || repository.access_token || (repository.credential && repository.credential.token);
+  const token = repositoryGitHubToken(repository);
   return {
     ...baseEnv,
     ...(token ? { GH_TOKEN: token, GITHUB_TOKEN: token } : {}),
   };
+}
+
+function isExistingPullRequestUpdateBranch(repository, branchName, pr) {
+  const update = existingPullRequestUpdate(repository);
+  if (!update) {
+    return false;
+  }
+  const updateBranchName = normalizeRef(update.branch_name || update.branch || repository.selected_ref);
+  if (updateBranchName && branchName === updateBranchName) {
+    return true;
+  }
+  if (update.pull_request_number && Number(update.pull_request_number) === Number(pr.number)) {
+    return true;
+  }
+  return Boolean(update.pull_request_url && pr.url && update.pull_request_url === pr.url);
 }
 
 function shouldUpdateExistingPullRequest(repository) {

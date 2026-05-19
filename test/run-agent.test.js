@@ -7,6 +7,7 @@ const path = require("node:path");
 const test = require("node:test");
 const { isDebugMode } = require("../actions/lib/core");
 const {
+  agentEnvironment,
   detectPullRequestsForChangedBranches,
   graphUpdateDraftFromOutput,
   graphUpdateDraftSchema,
@@ -125,6 +126,55 @@ test("opencode command passes model and permission bypass", () => {
     "openai/gpt-5.4",
     "Implement runtime auth",
   ]);
+});
+
+test("agent environment exports GitHub CLI tokens for PR-capable repositories", () => {
+  const env = agentEnvironment(
+    codingManifest({
+      repositories: [
+        {
+          repository_id: "0199e7be-9000-7000-8000-000000000003",
+          git_url: "https://github.com/example/repo.git",
+          checkout_path: "repo-a",
+          access_mode: "read_write",
+          auto_pull_request_enabled: true,
+          credential: { token: "ghs-pr-token" },
+        },
+        {
+          repository_id: "0199e7be-9000-7000-8000-000000000004",
+          git_url: "https://github.com/example/no-pr.git",
+          checkout_path: "repo-b",
+          access_mode: "read_write",
+          auto_pull_request_enabled: false,
+          credential: { token: "ghs-disabled-token" },
+        },
+        {
+          repository_id: "0199e7be-9000-7000-8000-000000000005",
+          git_url: "https://github.com/example/update-pr.git",
+          checkout_path: "repo-c",
+          access_mode: "read_write",
+          auto_pull_request_enabled: false,
+          credential: { token: "ghs-update-token" },
+          pull_request_update: {
+            pull_request_ref: "github:example/update-pr#12",
+            branch_name: "feature/review-fix",
+          },
+        },
+      ],
+    }),
+    {},
+  );
+  const tokenEntries = JSON.parse(env.LABOR0_GITHUB_TOKENS_JSON);
+
+  assert.equal(env.GH_TOKEN, "ghs-pr-token");
+  assert.equal(env.GITHUB_TOKEN, "ghs-pr-token");
+  assert.deepEqual(
+    tokenEntries.map((entry) => [entry.repository_id, entry.token]),
+    [
+      ["0199e7be-9000-7000-8000-000000000003", "ghs-pr-token"],
+      ["0199e7be-9000-7000-8000-000000000005", "ghs-update-token"],
+    ],
+  );
 });
 
 test("plan mode commands use runtime-specific read-only planning", () => {
@@ -1099,6 +1149,7 @@ test("coding prompt delegates pull request creation to the agent with repository
   assert.match(prompt, /create a new local branch, commit changes, push it, and open a pull request/);
   assert.match(prompt, /automatic pull requests are disabled; do not create a pull request/);
   assert.match(prompt, /update existing pull request github:example\/update-pr#12/);
+  assert.match(prompt, /The runner exports GH_TOKEN and GITHUB_TOKEN/);
   assert.match(prompt, /Pull request bodies must include a concise change summary and the tests or validation performed/);
 });
 
@@ -1318,6 +1369,82 @@ process.exit(1);
   assert.deepEqual(commands.map((command) => command.command), ["git"]);
   assert.deepEqual(commands[0].args, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
   assert.equal(commands.some((command) => command.command === "gh"), false);
+});
+
+test("existing pull request update branch created locally is ignored instead of rejected", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "labor0-existing-pr-branch-test-"));
+  const checkoutPath = path.join(tempDir, "repo");
+  const binPath = path.join(tempDir, "bin");
+  const logPath = path.join(tempDir, "commands.jsonl");
+  fs.mkdirSync(checkoutPath, { recursive: true });
+  fs.mkdirSync(binPath, { recursive: true });
+  writeExecutable(
+    path.join(binPath, "git"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LABOR0_TEST_COMMAND_LOG, JSON.stringify({ command: "git", args }) + "\\n");
+if (args[0] === "for-each-ref") {
+  process.stdout.write("main\\nfeature/review-fix\\n");
+}
+process.exit(0);
+`,
+  );
+  writeExecutable(
+    path.join(binPath, "gh"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.LABOR0_TEST_COMMAND_LOG, JSON.stringify({ command: "gh", args }) + "\\n");
+if (args[0] === "pr" && args[1] === "view" && args[2] === "feature/review-fix") {
+  process.stdout.write(JSON.stringify({ number: 12, url: "https://github.com/example/repo/pull/12", state: "OPEN", mergedAt: null }));
+  process.exit(0);
+}
+process.exit(1);
+`,
+  );
+
+  let pullRequests = [];
+  withEnv(
+    {
+      GITHUB_WORKSPACE: tempDir,
+      LABOR0_TEST_COMMAND_LOG: logPath,
+      PATH: `${binPath}${path.delimiter}${process.env.PATH || ""}`,
+    },
+    () => {
+      pullRequests = detectPullRequestsForChangedBranches(
+        {
+          repositories: [
+            {
+              repository_id: "0199e7be-9000-7000-8000-000000000003",
+              git_url: "https://github.com/example/repo.git",
+              checkout_path: "repo",
+              selected_ref: "refs/heads/main",
+              access_mode: "read_write",
+              auto_pull_request_enabled: false,
+              pull_request_update: {
+                pull_request_ref: "github:example/repo#12",
+                pull_request_number: 12,
+                pull_request_url: "https://github.com/example/repo/pull/12",
+                branch_name: "feature/review-fix",
+              },
+            },
+          ],
+        },
+        {
+          "0199e7be-9000-7000-8000-000000000003": ["main"],
+        },
+      );
+    },
+  );
+
+  assert.deepEqual(pullRequests, []);
+  const commands = fs
+    .readFileSync(logPath, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(commands.map((command) => command.command), ["git", "gh"]);
 });
 
 function writeExecutable(filePath, content) {
